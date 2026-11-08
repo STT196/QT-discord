@@ -123,6 +123,8 @@ private:
     bool m_lastRestIsPost = false;
 
     QVariantList activeMessagesFrom(const QString &channelId) const;
+    static quint64 snowflake(const QString &id);
+    void normalizeMessages(QJsonArray &arr) const;
     void sendResume();
     void doRetry();
 };

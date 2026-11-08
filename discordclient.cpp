@@ -10,6 +10,8 @@
 #include <QUrl>
 #include <QDateTime>
 #include <QCoreApplication>
+#include <algorithm>
+#include <vector>
 #include <cstdio>
 
 static void log(const char *fmt, ...) {
@@ -160,6 +162,37 @@ QVariantList DiscordClient::activeMessagesFrom(const QString &channelId) const {
     return out;
 }
 
+quint64 DiscordClient::snowflake(const QString &id) {
+    return id.toULongLong();
+}
+
+void DiscordClient::normalizeMessages(QJsonArray &arr) const {
+    // Dedup by message id (keep first occurrence).
+    QStringList seen;
+    for (int i = 0; i < arr.size(); ) {
+        const QString id = arr[i].toObject().value("id").toString();
+        if (seen.contains(id))
+            arr.removeAt(i);
+        else {
+            seen.append(id);
+            ++i;
+        }
+    }
+    // Stable sort by snowflake id descending (newest first).
+    std::vector<QJsonValue> vec;
+    vec.reserve(arr.size());
+    for (const QJsonValue &v : arr)
+        vec.push_back(v);
+    std::stable_sort(vec.begin(), vec.end(),
+                     [](const QJsonValue &a, const QJsonValue &b) {
+                         return snowflake(a.toObject().value("id").toString())
+                              > snowflake(b.toObject().value("id").toString());
+                     });
+    arr = QJsonArray();
+    for (const QJsonValue &v : vec)
+        arr.append(v);
+}
+
 void DiscordClient::onRestReply(QNetworkReply *reply) {
     const QByteArray data = reply->readAll();
     const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -254,6 +287,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     }
     case ChannelMessages: {
         QJsonArray arr = doc.array();
+        normalizeMessages(arr);
         m_messageCache[m_currentChannelId] = arr;
         m_messages = arr.toVariantList();
         emit messagesChanged();
@@ -270,6 +304,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         QJsonArray existing = m_messageCache.value(m_currentChannelId);
         for (int i = arr.size() - 1; i >= 0; --i)
             existing.prepend(arr[i]);
+        normalizeMessages(existing);
         m_messageCache[m_currentChannelId] = existing;
         m_messages = existing.toVariantList();
         emit messagesChanged();
@@ -467,6 +502,7 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         if (cid == m_currentChannelId) {
             QJsonArray arr = m_messageCache.value(m_currentChannelId);
             arr.prepend(msg);
+            normalizeMessages(arr);
             m_messageCache[m_currentChannelId] = arr;
             m_messages = arr.toVariantList();
             emit messagesChanged();
@@ -508,6 +544,7 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
                     break;
                 }
             }
+            normalizeMessages(arr);
             m_messageCache[m_currentChannelId] = arr;
             m_messages = arr.toVariantList();
             emit messagesChanged();
