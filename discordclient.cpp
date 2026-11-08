@@ -365,6 +365,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
             qPrintable(reply->errorString()));
         setStatus(QString("REST error: %1").arg(reply->errorString()));
         emit errorOccurred(reply->errorString());
+        m_restOp = None;
         return;
     }
     if (http < 200 || http >= 300) {
@@ -394,12 +395,14 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         }
         setStatus(QString("REST HTTP %1").arg(http));
         emit errorOccurred(QString("HTTP %1").arg(http));
+        m_restOp = None;
         return;
     }
 
     QJsonDocument doc = QJsonDocument::fromJson(data);
     if (doc.isNull()) {
         log("REST op=%d invalid json", (int)m_restOp);
+        m_restOp = None;
         return;
     }
 

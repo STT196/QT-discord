@@ -29,8 +29,12 @@ int main(int argc, char **argv) {
             token = argv[++i];
         else if (a == "--user")
             useBotPrefix = false;
-        else if (a == "--intents" && i + 1 < argc)
-            intents = QString(argv[++i]).toInt();
+        else if (a == "--intents" && i + 1 < argc) {
+            bool ok = false;
+            int v = QString(argv[++i]).toInt(&ok);
+            if (ok) intents = v;
+            else fprintf(stderr, "Ignoring non-numeric --intents value\n");
+        }
     }
     if (token.isEmpty()) {
         fprintf(stderr, "No token provided. Use --token <token> or set DISCORD_TOKEN env var.\n");
