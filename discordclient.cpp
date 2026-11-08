@@ -189,7 +189,7 @@ void DiscordClient::sendFile(const QString &channelId, const QString &filePath, 
     QFile *file = new QFile(filePath);
     if (!file->open(QIODevice::ReadOnly)) {
         log("sendFile: cannot open %s", qPrintable(filePath));
-        file->deleteLater();
+        delete file;
         return;
     }
     m_restOp = SendFile;
@@ -212,6 +212,8 @@ void DiscordClient::sendFile(const QString &channelId, const QString &filePath, 
     payload["attachments"] = attachments;
 
     QHttpPart jsonPart;
+    jsonPart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QStringLiteral("form-data; name=\"payload_json\"").toLatin1());
     jsonPart.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     jsonPart.setBody(QJsonDocument(payload).toJson(QJsonDocument::Compact));
     multiPart->append(jsonPart);
