@@ -1,0 +1,8 @@
+build/
+extracted/
+bootstrap/
+discord.app.asar
+.superpowers/
+out.txt
+err.txt
+*.user
