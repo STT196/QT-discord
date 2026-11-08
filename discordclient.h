@@ -31,6 +31,7 @@ class DiscordClient : public QObject {
     Q_PROPERTY(QVariantList channels READ channels NOTIFY channelsChanged)
     Q_PROPERTY(QVariantList messages READ messages NOTIFY messagesChanged)
     Q_PROPERTY(QVariantList activeMessages READ activeMessages NOTIFY activeMessagesChanged)
+    Q_PROPERTY(QVariantList dmChannels READ dmChannels NOTIFY dmChannelsChanged)
     Q_PROPERTY(QJsonObject user READ user NOTIFY userChanged)
     Q_PROPERTY(QString typingText READ typingText NOTIFY typingTextChanged)
 
@@ -46,6 +47,8 @@ public:
     Q_INVOKABLE void selectChannel(const QString &channelId);
     Q_INVOKABLE void selectGuild(const QString &guildId);
     Q_INVOKABLE void loadMoreMessages();
+    Q_INVOKABLE void refreshDms();
+    Q_INVOKABLE void openDm(const QString &userId);
     Q_INVOKABLE void addReaction(const QString &channelId, const QString &messageId, const QString &emoji);
     Q_INVOKABLE void removeReaction(const QString &channelId, const QString &messageId, const QString &emoji);
     Q_INVOKABLE void sendFile(const QString &channelId, const QString &filePath, const QString &content);
@@ -62,6 +65,7 @@ public:
     QVariantList channels() const { return m_channels; }
     QVariantList messages() const { return m_messages; }
     QVariantList activeMessages() const { return m_activeMessages; }
+    QVariantList dmChannels() const { return m_dmChannels; }
     QJsonObject user() const { return m_user; }
 
     signals:
@@ -72,6 +76,7 @@ public:
     void channelsChanged();
     void messagesChanged();
     void activeMessagesChanged();
+    void dmChannelsChanged();
     void userChanged();
     void typingTextChanged();
     void errorOccurred(const QString &msg);
@@ -86,7 +91,7 @@ private slots:
     void onHeartbeat();
 
 private:
-    enum RestOp { None, Me, MyGuilds, GuildChannels, ChannelMessages, ChannelMessagesMore, SendMessage, ReactionAdd, ReactionRemove, SendFile };
+    enum RestOp { None, Me, MyGuilds, GuildChannels, ChannelMessages, ChannelMessagesMore, SendMessage, ReactionAdd, ReactionRemove, SendFile, DmChannels, OpenDm };
     enum RestMethod { Get, Post, Put, Delete };
     void restGet(const QString &path);
     void restPost(const QString &path, const QJsonObject &body);
@@ -109,6 +114,7 @@ private:
     QString m_currentGuildId;
     QString m_currentChannelId;
     RestOp m_restOp = None;
+    bool m_gatewayStarted = false;
     QNetworkAccessManager m_nam;
     QSslSocket m_sock;
     QTimer m_hbTimer;
@@ -127,6 +133,7 @@ private:
     QVariantList m_messages;
     QMap<QString, QJsonArray> m_messageCache;
     QVariantList m_activeMessages;
+    QVariantList m_dmChannels;
     QString m_sessionId;
     qint64 m_lastSeq = 0;
     bool m_resumable = false;

@@ -287,9 +287,24 @@ void DiscordClient::selectChannel(const QString &channelId) {
         return;
     m_currentChannelId = channelId;
     emit currentChannelIdChanged();
-    m_activeMessages = activeMessagesFrom(channelId);
-    emit activeMessagesChanged();
     recomputeTyping();
+    if (!m_messageCache.contains(channelId)) {
+        m_restOp = ChannelMessages;
+        restGet(QString("/channels/%1/messages?limit=25").arg(channelId));
+    } else {
+        m_activeMessages = activeMessagesFrom(channelId);
+        emit activeMessagesChanged();
+    }
+}
+
+void DiscordClient::refreshDms() {
+    m_restOp = DmChannels;
+    restGet("/users/@me/channels");
+}
+
+void DiscordClient::openDm(const QString &userId) {
+    m_restOp = OpenDm;
+    restPost("/users/@me/channels", QJsonObject{{"recipient_id", userId}});
 }
 
 void DiscordClient::setStatus(const QString &s) {
@@ -451,7 +466,10 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         log("messages=%d in %s", arr.size(), qPrintable(m_currentChannelId));
         setStatus("Connected.");
         m_restOp = None;
-        connectGateway();
+        if (!m_gatewayStarted) {
+            m_gatewayStarted = true;
+            connectGateway();
+        }
         break;
     }
     case ChannelMessagesMore: {
@@ -467,6 +485,52 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         emit activeMessagesChanged();
         log("loaded %d older messages", arr.size());
         m_restOp = None;
+        break;
+    }
+    case DmChannels: {
+        QJsonArray arr = doc.array();
+        QVariantList list;
+        for (const QJsonValue &v : arr) {
+            QJsonObject o = v.toObject();
+            int type = o.value("type").toInt();
+            if (type != 1 && type != 3)
+                continue;
+            QVariantMap m;
+            m["id"] = o.value("id").toString();
+            m["type"] = type;
+            QString name = o.value("name").toString();
+            if (name.isEmpty()) {
+                QJsonArray recipients = o.value("recipients").toArray();
+                QStringList names;
+                for (const QJsonValue &rv : recipients) {
+                    QJsonObject ru = rv.toObject();
+                    QString rn = ru.value("global_name").toString();
+                    if (rn.isEmpty())
+                        rn = ru.value("username").toString();
+                    if (!rn.isEmpty())
+                        names.append(rn);
+                }
+                if (type == 1 && !names.isEmpty())
+                    name = names.first();
+                else if (type == 3)
+                    name = names.join(QStringLiteral(", "));
+            }
+            m["name"] = name;
+            m["recipients"] = o.value("recipients").toArray().toVariantList();
+            list.append(m);
+        }
+        m_dmChannels = list;
+        emit dmChannelsChanged();
+        m_restOp = None;
+        log("dms=%d", list.size());
+        break;
+    }
+    case OpenDm: {
+        QJsonObject created = doc.object();
+        log("dm opened id=%s", qPrintable(created.value("id").toString()));
+        setStatus("DM opened.");
+        m_restOp = None;
+        refreshDms();
         break;
     }
     case SendMessage: {
