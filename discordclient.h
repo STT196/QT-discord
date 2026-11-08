@@ -48,6 +48,9 @@ public:
     Q_INVOKABLE void addReaction(const QString &channelId, const QString &messageId, const QString &emoji);
     Q_INVOKABLE void removeReaction(const QString &channelId, const QString &messageId, const QString &emoji);
     Q_INVOKABLE void sendFile(const QString &channelId, const QString &filePath, const QString &content);
+    Q_INVOKABLE QString markdownToHtml(const QString &text) const;
+    Q_INVOKABLE QString emojiUrl(const QString &id, bool animated) const;
+    Q_INVOKABLE QString avatarUrl(const QJsonObject &user, int size = 64) const;
 
     QString status() const { return m_status; }
     QString currentGuildId() const { return m_currentGuildId; }

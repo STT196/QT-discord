@@ -15,6 +15,7 @@
 #include <QHttpMultiPart>
 #include <QHttpPart>
 #include <QMimeDatabase>
+#include <QRegularExpression>
 #include <algorithm>
 #include <vector>
 #include <cstdio>
@@ -901,4 +902,39 @@ void DiscordClient::sendResume() {
     d["seq"] = m_lastSeq;
     sendOp(6, d);
     log("RESUME sent seq=%lld", m_lastSeq);
+}
+
+QString DiscordClient::markdownToHtml(const QString &text) const {
+    if (text.isEmpty())
+        return QString();
+
+    QString s = text;
+    s.replace("&", "&amp;");
+    s.replace("<", "&lt;");
+    s.replace(">", "&gt;");
+    s.replace("\"", "&quot;");
+
+    s.replace(QRegularExpression("```([\\s\\S]*?)```"), "<pre>\\1</pre>");
+    s.replace(QRegularExpression("`([^`]+)`"), "<code>\\1</code>");
+    s.replace(QRegularExpression("\\*\\*([^*]+)\\*\\*"), "<b>\\1</b>");
+    s.replace(QRegularExpression("__([^_]+)__"), "<u>\\1</u>");
+    s.replace(QRegularExpression("\\*([^*]+)\\*"), "<i>\\1</i>");
+    s.replace(QRegularExpression("_([^_]+)_"), "<i>\\1</i>");
+    s.replace(QRegularExpression("~~([^~]+)~~"), "<s>\\1</s>");
+    s.replace(QRegularExpression("\\|\\|([^|]+)\\|\\|"),
+              "<span style=\"background-color:#202225;color:#202225\">\\1</span>");
+    s.replace(QRegularExpression("(https?://[^\\s<]+)"), "<a href=\"\\1\">\\1</a>");
+    return s;
+}
+
+QString DiscordClient::emojiUrl(const QString &id, bool animated) const {
+    return QString("https://cdn.discordapp.com/emojis/%1.%2").arg(id, animated ? "gif" : "png");
+}
+
+QString DiscordClient::avatarUrl(const QJsonObject &user, int size) const {
+    const QString id = user.value("id").toString();
+    const QString hash = user.value("avatar").toString();
+    if (hash.isEmpty())
+        return QStringLiteral("https://cdn.discordapp.com/embed/avatars/0.png");
+    return QString("https://cdn.discordapp.com/avatars/%1/%2.png?size=%3").arg(id, hash).arg(size);
 }
