@@ -9,6 +9,11 @@
 #include <QJsonArray>
 #include <QMap>
 #include <QString>
+#include <QFile>
+#include <QFileInfo>
+#include <QHttpMultiPart>
+#include <QHttpPart>
+#include <QMimeDatabase>
 
 // Minimal Discord client: REST + Gateway v10, text-only.
 // Protocol recovered from Discord's Electron app.asar:
@@ -42,6 +47,7 @@ public:
     Q_INVOKABLE void loadMoreMessages();
     Q_INVOKABLE void addReaction(const QString &channelId, const QString &messageId, const QString &emoji);
     Q_INVOKABLE void removeReaction(const QString &channelId, const QString &messageId, const QString &emoji);
+    Q_INVOKABLE void sendFile(const QString &channelId, const QString &filePath, const QString &content);
 
     QString status() const { return m_status; }
     QString currentGuildId() const { return m_currentGuildId; }
@@ -73,7 +79,7 @@ private slots:
     void onHeartbeat();
 
 private:
-    enum RestOp { None, Me, MyGuilds, GuildChannels, ChannelMessages, ChannelMessagesMore, SendMessage, ReactionAdd, ReactionRemove };
+    enum RestOp { None, Me, MyGuilds, GuildChannels, ChannelMessages, ChannelMessagesMore, SendMessage, ReactionAdd, ReactionRemove, SendFile };
     enum RestMethod { Get, Post, Put, Delete };
     void restGet(const QString &path);
     void restPost(const QString &path, const QJsonObject &body);

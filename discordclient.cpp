@@ -10,6 +10,11 @@
 #include <QUrl>
 #include <QDateTime>
 #include <QCoreApplication>
+#include <QFile>
+#include <QFileInfo>
+#include <QHttpMultiPart>
+#include <QHttpPart>
+#include <QMimeDatabase>
 #include <algorithm>
 #include <vector>
 #include <cstdio>
@@ -176,6 +181,57 @@ void DiscordClient::sendMessage(const QString &channelId, const QString &content
     restPost(QString("/channels/%1/messages").arg(channelId), QJsonObject{{"content", content}});
 }
 
+void DiscordClient::sendFile(const QString &channelId, const QString &filePath, const QString &content) {
+    if (filePath.isEmpty()) {
+        log("sendFile: empty file path");
+        return;
+    }
+    QFile *file = new QFile(filePath);
+    if (!file->open(QIODevice::ReadOnly)) {
+        log("sendFile: cannot open %s", qPrintable(filePath));
+        file->deleteLater();
+        return;
+    }
+    m_restOp = SendFile;
+    QUrl url(QString("https://discord.com/api/channels/%1/messages").arg(channelId));
+    QNetworkRequest req(url);
+    QString authHeader = m_useBotPrefix ? QString("Bot %1").arg(m_token) : m_token;
+    req.setRawHeader("Authorization", authHeader.toLatin1());
+    req.setRawHeader("User-Agent", "QtDiscord/0.1");
+
+    QHttpMultiPart *multiPart = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+
+    QJsonObject payload;
+    if (!content.isEmpty())
+        payload["content"] = content;
+    QJsonArray attachments;
+    QJsonObject att;
+    att["id"] = 0;
+    att["filename"] = QFileInfo(filePath).fileName();
+    attachments.append(att);
+    payload["attachments"] = attachments;
+
+    QHttpPart jsonPart;
+    jsonPart.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    jsonPart.setBody(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    multiPart->append(jsonPart);
+
+    QHttpPart filePart;
+    filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QString("form-data; name=\"files[0]\"; filename=\"%1\"").arg(QFileInfo(filePath).fileName()).toLatin1());
+    QMimeDatabase mimeDb;
+    QString mimeType = mimeDb.mimeTypeForFile(filePath).name();
+    if (mimeType.isEmpty())
+        mimeType = QStringLiteral("application/octet-stream");
+    filePart.setHeader(QNetworkRequest::ContentTypeHeader, mimeType.toLatin1());
+    filePart.setBodyDevice(file);
+    multiPart->append(filePart);
+
+    QNetworkReply *reply = m_nam.post(req, multiPart);
+    multiPart->setParent(reply);
+    file->setParent(reply);
+}
+
 void DiscordClient::selectChannel(const QString &channelId) {
     if (channelId == m_currentChannelId)
         return;
@@ -248,6 +304,12 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     if (http < 200 || http >= 300) {
         log("REST op=%d http=%d", (int)m_restOp, http);
         if (http == 429) {
+        if (m_restOp == SendFile) {
+            log("REST op=%d http=429 (multipart, no retry)", (int)m_restOp);
+            setStatus("File upload rate limited.");
+            m_restOp = None;
+            return;
+        }
             int retryAfter = 5000;
             QJsonDocument doc = QJsonDocument::fromJson(data);
             if (!doc.isNull())
@@ -372,6 +434,12 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     case ReactionRemove: {
         log("reaction removed");
         setStatus("Reaction removed.");
+        m_restOp = None;
+        break;
+    }
+    case SendFile: {
+        log("file upload complete");
+        setStatus("File uploaded.");
         m_restOp = None;
         break;
     }
