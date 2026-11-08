@@ -18,6 +18,7 @@ int main(int argc, char **argv) {
     qInstallMessageHandler(messageHandler);
 
     QGuiApplication app(argc, argv);
+    qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
 
     QString token = QProcessEnvironment::systemEnvironment().value("DISCORD_TOKEN");
     bool useBotPrefix = true;
