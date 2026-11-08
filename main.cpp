@@ -21,12 +21,15 @@ int main(int argc, char **argv) {
 
     QString token = QProcessEnvironment::systemEnvironment().value("DISCORD_TOKEN");
     bool useBotPrefix = true;
+    int intents = 513;
     for (int i = 1; i < argc; ++i) {
         QString a = argv[i];
         if (a == "--token" && i + 1 < argc)
             token = argv[++i];
         else if (a == "--user")
             useBotPrefix = false;
+        else if (a == "--intents" && i + 1 < argc)
+            intents = QString(argv[++i]).toInt();
     }
     if (token.isEmpty()) {
         fprintf(stderr, "No token provided. Use --token <token> or set DISCORD_TOKEN env var.\n");
@@ -37,6 +40,7 @@ int main(int argc, char **argv) {
     DiscordClient client;
     client.setToken(token);
     client.setUseBotPrefix(useBotPrefix);
+    client.setIntents(intents);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("discordClient", &client);

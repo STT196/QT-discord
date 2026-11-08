@@ -43,6 +43,8 @@ void DiscordClient::setToken(const QString &token) { m_token = token; }
 
 void DiscordClient::setUseBotPrefix(bool useBot) { m_useBotPrefix = useBot; }
 
+void DiscordClient::setIntents(int intents) { m_intents = intents; }
+
 void DiscordClient::loadMoreMessages() {
     if (m_currentChannelId.isEmpty())
         return;
@@ -578,7 +580,7 @@ void DiscordClient::sendOp(int op, const QJsonObject &d) {
 void DiscordClient::identify() {
     QJsonObject d;
     d["token"] = m_token;
-    d["intents"] = 513;
+    d["intents"] = m_intents;
     QJsonObject props;
     props["os"] = "Qt";
     props["browser"] = "QtDiscord";

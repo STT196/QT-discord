@@ -50,6 +50,13 @@ Get a bot token at https://discord.com/developers/applications (Bot section). In
 
 No token = exits code 1 with a stderr message (no window opens).
 
+## Gateway intents
+
+IDENTIFY sends `intents` (default `513` = GUILDS | GUILD_MESSAGES). Override with `--intents <N>`:
+
+- Bot token, to receive message `content` in `MESSAGE_CREATE`: enable "Message Content Intent" in the Discord developer portal and run with `--intents 33281` (513 + 32768 MESSAGE_CONTENT). Without enabling it in the portal, Discord closes with 4014.
+- User token: no privileged intent needed; keep the default `513`.
+
 ## Deferred scope (not built — add later)
 
 These are real work, not speculative. Add in this order:

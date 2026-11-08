@@ -32,6 +32,8 @@ public:
     explicit DiscordClient(QObject *parent = nullptr);
     void setToken(const QString &token);
     void setUseBotPrefix(bool useBot);
+    void setIntents(int intents);
+    int intents() const { return m_intents; }
     void connectGateway();
 
     Q_INVOKABLE void sendMessage(const QString &channelId, const QString &content);
@@ -84,6 +86,7 @@ private:
 
     QString m_token;
     bool m_useBotPrefix = true;
+    int m_intents = 513;
     QString m_status = "Connecting...";
     QString m_currentGuildId;
     QString m_currentChannelId;
