@@ -40,6 +40,8 @@ DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
     connect(&m_hbTimer, &QTimer::timeout, this, &DiscordClient::onHeartbeat);
     connect(&m_retryTimer, &QTimer::timeout, this, &DiscordClient::doRetry);
     m_retryTimer.setSingleShot(true);
+    connect(&m_typingTimer, &QTimer::timeout, this, &DiscordClient::pruneTyping);
+    m_typingTimer.setSingleShot(true);
 
     // Bootstrap: who am I?
     restGet("/users/@me");
@@ -62,6 +64,47 @@ void DiscordClient::loadMoreMessages() {
     QString before = it.value().last().toObject().value("id").toString();
     m_restOp = ChannelMessagesMore;
     restGet(QString("/channels/%1/messages?before=%2&limit=50").arg(m_currentChannelId, before));
+}
+
+void DiscordClient::recomputeTyping() {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QStringList names;
+    const QHash<QString, qint64> typing = m_typing.value(m_currentChannelId);
+    for (auto it = typing.constBegin(); it != typing.constEnd(); ++it) {
+        if (now - it.value() <= 8000)
+            names.append(m_userNames.value(it.key(), QStringLiteral("someone")));
+    }
+    QString text;
+    if (names.isEmpty()) {
+        text = QString();
+    } else if (names.size() == 1) {
+        text = QString("%1 is typing…").arg(names.first());
+    } else if (names.size() == 2) {
+        text = QString("%1 and %2 are typing…").arg(names.first(), names.last());
+    } else {
+        text = QStringLiteral("several people are typing…");
+    }
+    if (m_typingText != text) {
+        m_typingText = text;
+        emit typingTextChanged();
+    }
+}
+
+void DiscordClient::pruneTyping() {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (auto it = m_typing.begin(); it != m_typing.end();) {
+        for (auto uit = it.value().begin(); uit != it.value().end();) {
+            if (now - uit.value() > 8000)
+                uit = it.value().erase(uit);
+            else
+                ++uit;
+        }
+        if (it.value().isEmpty())
+            it = m_typing.erase(it);
+        else
+            ++it;
+    }
+    recomputeTyping();
 }
 
 void DiscordClient::doRetry() {
@@ -103,6 +146,10 @@ void DiscordClient::selectGuild(const QString &guildId) {
         return;
     m_currentGuildId = guildId;
     m_currentChannelId.clear();
+    if (!m_typingText.isEmpty()) {
+        m_typingText.clear();
+        emit typingTextChanged();
+    }
     emit currentGuildIdChanged();
     emit currentChannelIdChanged();
     m_messages.clear();
@@ -242,6 +289,7 @@ void DiscordClient::selectChannel(const QString &channelId) {
     emit currentChannelIdChanged();
     m_activeMessages = activeMessagesFrom(channelId);
     emit activeMessagesChanged();
+    recomputeTyping();
 }
 
 void DiscordClient::setStatus(const QString &s) {
@@ -495,6 +543,10 @@ void DiscordClient::addReaction(const QString &channelId, const QString &message
     m_restOp = ReactionAdd;
     restPut(QString("/channels/%1/messages/%2/reactions/%3/@me")
             .arg(channelId, messageId, QString::fromLatin1(QUrl::toPercentEncoding(emoji))));
+}
+
+void DiscordClient::triggerTyping(const QString &channelId) {
+    restPost(QString("/channels/%1/typing").arg(channelId), QJsonObject());
 }
 
 void DiscordClient::removeReaction(const QString &channelId, const QString &messageId, const QString &emoji) {
@@ -785,6 +837,36 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
             m_activeMessages = activeMessagesFrom(m_currentChannelId);
             emit activeMessagesChanged();
         }
+        return;
+    }
+    if (t == "TYPING_START") {
+        QJsonObject ev = d.toObject();
+        QString channelId = ev.value("channel_id").toString();
+        QString userId = ev.value("user_id").toString();
+        QString name;
+        QJsonObject user = ev.value("user").toObject();
+        if (!user.isEmpty()) {
+            name = user.value("global_name").toString();
+            if (name.isEmpty())
+                name = user.value("username").toString();
+        }
+        if (name.isEmpty()) {
+            QJsonObject member = ev.value("member").toObject();
+            QJsonObject muser = member.value("user").toObject();
+            if (!muser.isEmpty()) {
+                name = muser.value("global_name").toString();
+                if (name.isEmpty())
+                    name = muser.value("username").toString();
+            }
+        }
+        if (name.isEmpty())
+            name = QStringLiteral("someone");
+        m_typing[channelId][userId] = QDateTime::currentMSecsSinceEpoch();
+        m_userNames[userId] = name;
+        if (channelId == m_currentChannelId)
+            recomputeTyping();
+        m_typingTimer.start(8500);
+        log("TYPING_START channel=%s user=%s (%s)", qPrintable(channelId), qPrintable(userId), qPrintable(name));
         return;
     }
     if (t == "MESSAGE_REACTION_REMOVE_EMOJI") {

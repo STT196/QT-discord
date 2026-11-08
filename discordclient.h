@@ -32,6 +32,7 @@ class DiscordClient : public QObject {
     Q_PROPERTY(QVariantList messages READ messages NOTIFY messagesChanged)
     Q_PROPERTY(QVariantList activeMessages READ activeMessages NOTIFY activeMessagesChanged)
     Q_PROPERTY(QJsonObject user READ user NOTIFY userChanged)
+    Q_PROPERTY(QString typingText READ typingText NOTIFY typingTextChanged)
 
 public:
     explicit DiscordClient(QObject *parent = nullptr);
@@ -51,8 +52,10 @@ public:
     Q_INVOKABLE QString markdownToHtml(const QString &text) const;
     Q_INVOKABLE QString emojiUrl(const QString &id, bool animated) const;
     Q_INVOKABLE QString avatarUrl(const QJsonObject &user, int size = 64) const;
+    Q_INVOKABLE void triggerTyping(const QString &channelId);
 
     QString status() const { return m_status; }
+    QString typingText() const { return m_typingText; }
     QString currentGuildId() const { return m_currentGuildId; }
     QString currentChannelId() const { return m_currentChannelId; }
     QVariantList guilds() const { return m_guilds; }
@@ -70,6 +73,7 @@ public:
     void messagesChanged();
     void activeMessagesChanged();
     void userChanged();
+    void typingTextChanged();
     void errorOccurred(const QString &msg);
 
 private slots:
@@ -109,6 +113,7 @@ private:
     QSslSocket m_sock;
     QTimer m_hbTimer;
     QTimer m_retryTimer;
+    QTimer m_typingTimer;
     QByteArray m_buffer;
     bool m_inHttp = false;
     QString m_handshakePath;
@@ -126,6 +131,10 @@ private:
     qint64 m_lastSeq = 0;
     bool m_resumable = false;
     bool m_wantResume = false;
+
+    QString m_typingText;
+    QMap<QString, QHash<QString, qint64>> m_typing;      // channelId → userId → lastSeen ms
+    QHash<QString, QString> m_userNames;                 // userId → display name
 
     // Rate-limit retry (one pending request).
     QString m_retryPath;
@@ -146,4 +155,7 @@ private:
     void updateReaction(const QString &channelId, const QString &messageId, const QJsonObject &emoji, int delta, bool self);
     void sendResume();
     void doRetry();
+
+    void recomputeTyping();
+    void pruneTyping();
 };
