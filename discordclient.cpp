@@ -59,13 +59,24 @@ void DiscordClient::loadMoreMessages() {
 }
 
 void DiscordClient::doRetry() {
-    if (m_retryIsPost)
+    switch (m_retryMethod) {
+    case Post:
         restPost(m_retryPath, m_retryBody);
-    else
+        break;
+    case Put:
+        restPut(m_retryPath);
+        break;
+    case Delete:
+        restDelete(m_retryPath);
+        break;
+    default:
         restGet(m_retryPath);
+        break;
+    }
     m_retryPath.clear();
     m_retryBody = QJsonObject();
     m_retryIsPost = false;
+    m_retryMethod = Get;
     m_retryOp = None;
     setStatus("Retrying rate-limited request...");
 }
@@ -112,6 +123,7 @@ void DiscordClient::restGet(const QString &path) {
     m_lastRestPath = path;
     m_lastRestBody = QJsonObject();
     m_lastRestIsPost = false;
+    m_lastRestMethod = Get;
     m_nam.get(req);
 }
 
@@ -126,7 +138,35 @@ void DiscordClient::restPost(const QString &path, const QJsonObject &body) {
     m_lastRestPath = path;
     m_lastRestBody = body;
     m_lastRestIsPost = true;
+    m_lastRestMethod = Post;
     m_nam.post(req, data);
+}
+
+void DiscordClient::restPut(const QString &path) {
+    QUrl url(QString("https://discord.com/api%1").arg(path));
+    QNetworkRequest req(url);
+    QString authHeader = m_useBotPrefix ? QString("Bot %1").arg(m_token) : m_token;
+    req.setRawHeader("Authorization", authHeader.toLatin1());
+    req.setRawHeader("User-Agent", "QtDiscord/0.1");
+    req.setRawHeader("Content-Type", "application/json");
+    m_lastRestPath = path;
+    m_lastRestBody = QJsonObject();
+    m_lastRestIsPost = false;
+    m_lastRestMethod = Put;
+    m_nam.put(req, QByteArray());
+}
+
+void DiscordClient::restDelete(const QString &path) {
+    QUrl url(QString("https://discord.com/api%1").arg(path));
+    QNetworkRequest req(url);
+    QString authHeader = m_useBotPrefix ? QString("Bot %1").arg(m_token) : m_token;
+    req.setRawHeader("Authorization", authHeader.toLatin1());
+    req.setRawHeader("User-Agent", "QtDiscord/0.1");
+    m_lastRestPath = path;
+    m_lastRestBody = QJsonObject();
+    m_lastRestIsPost = false;
+    m_lastRestMethod = Delete;
+    m_nam.deleteResource(req);
 }
 
 void DiscordClient::sendMessage(const QString &channelId, const QString &content) {
@@ -217,6 +257,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
             m_retryPath = m_lastRestPath;
             m_retryBody = m_lastRestBody;
             m_retryIsPost = m_lastRestIsPost;
+            m_retryMethod = m_lastRestMethod;
             m_retryOp = m_restOp;
             m_restOp = None;
             setStatus(QString("Rate limited, retrying in %1 ms").arg(retryAfter));
@@ -237,8 +278,9 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     switch (m_restOp) {
     case Me: {
         m_user = doc.object();
+        m_selfId = m_user.value("id").toString();
         emit userChanged();
-        log("logged in as %s", qPrintable(m_user.value("username").toString()));
+        log("logged in as %s (id=%s)", qPrintable(m_user.value("username").toString()), qPrintable(m_selfId));
         setStatus("Fetching guilds...");
         m_restOp = MyGuilds;
         restGet("/users/@me/guilds");
@@ -321,9 +363,73 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         m_restOp = None;
         break;
     }
+    case ReactionAdd: {
+        log("reaction added");
+        setStatus("Reaction added.");
+        m_restOp = None;
+        break;
+    }
+    case ReactionRemove: {
+        log("reaction removed");
+        setStatus("Reaction removed.");
+        m_restOp = None;
+        break;
+    }
     default:
         break;
     }
+}
+
+QString DiscordClient::reactionKey(const QJsonObject &emoji) {
+    QString id = emoji.value("id").toString();
+    if (!id.isEmpty())
+        return id;
+    return emoji.value("name").toString();
+}
+
+void DiscordClient::updateReaction(const QString &channelId, const QString &messageId, const QJsonObject &emoji, int delta, bool self) {
+    auto it = m_messageCache.find(channelId);
+    if (it == m_messageCache.end())
+        return;
+    QJsonArray arr = it.value();
+    QString key = reactionKey(emoji);
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject msg = arr[i].toObject();
+        if (msg.value("id").toString() != messageId)
+            continue;
+        QJsonArray reactions = msg.value("reactions").toArray();
+        for (int j = 0; j < reactions.size(); ++j) {
+            QJsonObject entry = reactions[j].toObject();
+            if (reactionKey(entry.value("emoji").toObject()) != key)
+                continue;
+            int count = entry.value("count").toInt() + delta;
+            entry["count"] = count;
+            entry["me"] = self;
+            if (count <= 0)
+                reactions.removeAt(j);
+            else
+                reactions[j] = entry;
+            break;
+        }
+        msg["reactions"] = reactions;
+        if (reactions.isEmpty())
+            msg.remove("reactions");
+        arr[i] = msg;
+        m_messageCache[channelId] = arr;
+        break;
+    }
+}
+
+void DiscordClient::addReaction(const QString &channelId, const QString &messageId, const QString &emoji) {
+    m_restOp = ReactionAdd;
+    restPut(QString("/channels/%1/messages/%2/reactions/%3/@me")
+            .arg(channelId, messageId, QString::fromLatin1(QUrl::toPercentEncoding(emoji))));
+}
+
+void DiscordClient::removeReaction(const QString &channelId, const QString &messageId, const QString &emoji) {
+    m_restOp = ReactionRemove;
+    restDelete(QString("/channels/%1/messages/%2/reactions/%3/@me")
+               .arg(channelId, messageId, QString::fromLatin1(QUrl::toPercentEncoding(emoji))));
 }
 
 void DiscordClient::onConnected() {
@@ -545,6 +651,97 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
                 }
             }
             normalizeMessages(arr);
+            m_messageCache[m_currentChannelId] = arr;
+            m_messages = arr.toVariantList();
+            emit messagesChanged();
+            m_activeMessages = activeMessagesFrom(m_currentChannelId);
+            emit activeMessagesChanged();
+        }
+        return;
+    }
+    if (t == "MESSAGE_REACTION_ADD") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        QString mid = ev.value("message_id").toString();
+        QJsonObject emoji = ev.value("emoji").toObject();
+        QString uid = ev.value("user_id").toString();
+        log("MESSAGE_REACTION_ADD channel=%s message=%s", qPrintable(cid), qPrintable(mid));
+        if (cid == m_currentChannelId) {
+            updateReaction(cid, mid, emoji, +1, uid == m_selfId);
+            QJsonArray arr = m_messageCache.value(m_currentChannelId);
+            m_messages = arr.toVariantList();
+            emit messagesChanged();
+            m_activeMessages = activeMessagesFrom(m_currentChannelId);
+            emit activeMessagesChanged();
+        }
+        return;
+    }
+    if (t == "MESSAGE_REACTION_REMOVE") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        QString mid = ev.value("message_id").toString();
+        QJsonObject emoji = ev.value("emoji").toObject();
+        QString uid = ev.value("user_id").toString();
+        log("MESSAGE_REACTION_REMOVE channel=%s message=%s", qPrintable(cid), qPrintable(mid));
+        if (cid == m_currentChannelId) {
+            updateReaction(cid, mid, emoji, -1, uid == m_selfId);
+            QJsonArray arr = m_messageCache.value(m_currentChannelId);
+            m_messages = arr.toVariantList();
+            emit messagesChanged();
+            m_activeMessages = activeMessagesFrom(m_currentChannelId);
+            emit activeMessagesChanged();
+        }
+        return;
+    }
+    if (t == "MESSAGE_REACTION_REMOVE_ALL") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        QString mid = ev.value("message_id").toString();
+        log("MESSAGE_REACTION_REMOVE_ALL channel=%s message=%s", qPrintable(cid), qPrintable(mid));
+        if (cid == m_currentChannelId) {
+            QJsonArray arr = m_messageCache.value(m_currentChannelId);
+            for (int i = 0; i < arr.size(); ++i) {
+                QJsonObject msg = arr[i].toObject();
+                if (msg.value("id").toString() != mid)
+                    continue;
+                msg.remove("reactions");
+                arr[i] = msg;
+                break;
+            }
+            m_messageCache[m_currentChannelId] = arr;
+            m_messages = arr.toVariantList();
+            emit messagesChanged();
+            m_activeMessages = activeMessagesFrom(m_currentChannelId);
+            emit activeMessagesChanged();
+        }
+        return;
+    }
+    if (t == "MESSAGE_REACTION_REMOVE_EMOJI") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        QString mid = ev.value("message_id").toString();
+        QJsonObject emoji = ev.value("emoji").toObject();
+        log("MESSAGE_REACTION_REMOVE_EMOJI channel=%s message=%s", qPrintable(cid), qPrintable(mid));
+        if (cid == m_currentChannelId) {
+            QString key = reactionKey(emoji);
+            QJsonArray arr = m_messageCache.value(m_currentChannelId);
+            for (int i = 0; i < arr.size(); ++i) {
+                QJsonObject msg = arr[i].toObject();
+                if (msg.value("id").toString() != mid)
+                    continue;
+                QJsonArray reactions = msg.value("reactions").toArray();
+                for (int j = 0; j < reactions.size(); ++j) {
+                    if (reactionKey(reactions[j].toObject().value("emoji").toObject()) != key)
+                        continue;
+                    reactions.removeAt(j);
+                    break;
+                }
+                msg["reactions"] = reactions;
+                if (reactions.isEmpty())
+                    msg.remove("reactions");
+                arr[i] = msg;
+                break;
+            }
             m_messageCache[m_currentChannelId] = arr;
             m_messages = arr.toVariantList();
             emit messagesChanged();

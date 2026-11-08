@@ -40,6 +40,8 @@ public:
     Q_INVOKABLE void selectChannel(const QString &channelId);
     Q_INVOKABLE void selectGuild(const QString &guildId);
     Q_INVOKABLE void loadMoreMessages();
+    Q_INVOKABLE void addReaction(const QString &channelId, const QString &messageId, const QString &emoji);
+    Q_INVOKABLE void removeReaction(const QString &channelId, const QString &messageId, const QString &emoji);
 
     QString status() const { return m_status; }
     QString currentGuildId() const { return m_currentGuildId; }
@@ -71,9 +73,12 @@ private slots:
     void onHeartbeat();
 
 private:
-    enum RestOp { None, Me, MyGuilds, GuildChannels, ChannelMessages, ChannelMessagesMore, SendMessage };
+    enum RestOp { None, Me, MyGuilds, GuildChannels, ChannelMessages, ChannelMessagesMore, SendMessage, ReactionAdd, ReactionRemove };
+    enum RestMethod { Get, Post, Put, Delete };
     void restGet(const QString &path);
     void restPost(const QString &path, const QJsonObject &body);
+    void restPut(const QString &path);
+    void restDelete(const QString &path);
     void fetchGuildChannels(const QString &guildId);
     void sendTextFrame(const QString &text);
     void sendOp(int op, const QJsonObject &d);
@@ -102,6 +107,7 @@ private:
     qint64 m_lastHeartbeat = 0;
     qint64 m_lastHeartbeatAck = 0;
     QJsonObject m_user;
+    QString m_selfId;
     QVariantList m_guilds;
     QVariantList m_channels;
     QVariantList m_messages;
@@ -116,15 +122,19 @@ private:
     QString m_retryPath;
     QJsonObject m_retryBody;
     bool m_retryIsPost = false;
+    RestMethod m_retryMethod = Get;
     RestOp m_retryOp = None;
 
     QString m_lastRestPath;
     QJsonObject m_lastRestBody;
     bool m_lastRestIsPost = false;
+    RestMethod m_lastRestMethod = Get;
 
     QVariantList activeMessagesFrom(const QString &channelId) const;
     static quint64 snowflake(const QString &id);
+    static QString reactionKey(const QJsonObject &emoji);
     void normalizeMessages(QJsonArray &arr) const;
+    void updateReaction(const QString &channelId, const QString &messageId, const QJsonObject &emoji, int delta, bool self);
     void sendResume();
     void doRetry();
 };
