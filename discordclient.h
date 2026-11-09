@@ -37,6 +37,7 @@ class DiscordClient : public QObject {
     Q_PROPERTY(QJsonObject user READ user NOTIFY userChanged)
     Q_PROPERTY(bool loggedIn READ loggedIn NOTIFY userChanged)
     Q_PROPERTY(QString typingText READ typingText NOTIFY typingTextChanged)
+    Q_PROPERTY(QString theme READ theme WRITE setTheme NOTIFY themeChanged)
 
 public:
     explicit DiscordClient(QObject *parent = nullptr);
@@ -61,9 +62,11 @@ public:
     Q_INVOKABLE QString emojiUrl(const QString &id, bool animated) const;
     Q_INVOKABLE QString avatarUrl(const QJsonObject &user, int size = 64) const;
     Q_INVOKABLE void triggerTyping(const QString &channelId);
+    void setTheme(const QString &t);
 
     QString status() const { return m_status; }
     QString typingText() const { return m_typingText; }
+    QString theme() const { return m_theme; }
     QString currentGuildId() const { return m_currentGuildId; }
     QString currentChannelId() const { return m_currentChannelId; }
     QVariantList guilds() const { return m_guilds; }
@@ -87,6 +90,7 @@ public:
     void membersChanged();
     void userChanged();
     void typingTextChanged();
+    void themeChanged();
     void errorOccurred(const QString &msg);
 
 private slots:
@@ -150,6 +154,7 @@ private:
     bool m_wantResume = false;
 
     QString m_typingText;
+    QString m_theme = "dark";
     QMap<QString, QHash<QString, qint64>> m_typing;      // channelId → userId → lastSeen ms
     QHash<QString, QString> m_userNames;                 // userId → display name
 

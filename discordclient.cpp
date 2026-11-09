@@ -10,6 +10,7 @@
 #include <QUrl>
 #include <QDateTime>
 #include <QCoreApplication>
+#include <QSettings>
 #include <QFile>
 #include <QFileInfo>
 #include <QHttpMultiPart>
@@ -64,6 +65,10 @@ DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
     m_retryTimer.setSingleShot(true);
     connect(&m_typingTimer, &QTimer::timeout, this, &DiscordClient::pruneTyping);
     m_typingTimer.setSingleShot(true);
+
+    m_theme = QSettings("QtDiscord", "QtDiscord").value("theme", "dark").toString();
+    if (m_theme != "light" && m_theme != "dark")
+        m_theme = "dark";
 }
 
 void DiscordClient::login(const QString &token, bool useBot) {
@@ -337,6 +342,16 @@ void DiscordClient::refreshDms() {
 void DiscordClient::openDm(const QString &userId) {
     m_restOp = OpenDm;
     restPost("/users/@me/channels", QJsonObject{{"recipient_id", userId}});
+}
+
+void DiscordClient::setTheme(const QString &t) {
+    if (t != "light" && t != "dark")
+        return;
+    if (m_theme == t)
+        return;
+    m_theme = t;
+    QSettings("QtDiscord", "QtDiscord").setValue("theme", t);
+    emit themeChanged();
 }
 
 void DiscordClient::setStatus(const QString &s) {

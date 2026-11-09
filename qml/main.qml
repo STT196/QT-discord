@@ -37,17 +37,17 @@ ApplicationWindow {
         return "#80848e";
     }
 
-    // Discord dark palette
-    readonly property color cRail: "#1e1f22"
-    readonly property color cSidebar: "#2b2d31"
-    readonly property color cMain: "#313338"
-    readonly property color cHeader: "#313338"
-    readonly property color cInput: "#383a40"
-    readonly property color cText: "#dbdee1"
-    readonly property color cMuted: "#949ba4"
-    readonly property color cAccent: "#5865f2"
-    readonly property color cHover: "#35373c"
-    readonly property color cActive: "#404249"
+    // Discord palette (persisted light/dark theme)
+    readonly property color cRail: client.theme === "light" ? "#e3e5e8" : "#1e1f22"
+    readonly property color cSidebar: client.theme === "light" ? "#f2f3f5" : "#2b2d31"
+    readonly property color cMain: client.theme === "light" ? "#ffffff" : "#313338"
+    readonly property color cHeader: client.theme === "light" ? "#ffffff" : "#313338"
+    readonly property color cInput: client.theme === "light" ? "#ebedef" : "#383a40"
+    readonly property color cText: client.theme === "light" ? "#2e3338" : "#dbdee1"
+    readonly property color cMuted: client.theme === "light" ? "#5c5e66" : "#949ba4"
+    readonly property color cAccent: client.theme === "light" ? "#5865f2" : "#5865f2"
+    readonly property color cHover: client.theme === "light" ? "#e3e5e8" : "#35373c"
+    readonly property color cActive: client.theme === "light" ? "#d4d7dc" : "#404249"
 
     function avatar(a) {
         if (!a || !a["avatar"])
@@ -257,6 +257,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                         }
                         Button { text: "Members"; implicitHeight: 28; onClicked: root.showMembers = !root.showMembers }
+                        Button { text: client.theme === "light" ? "Dark" : "Light"; implicitHeight: 28; onClicked: client.setTheme(client.theme === "light" ? "dark" : "light") }
                         Text { text: client.status; color: root.cMuted; font.pixelSize: 12; Layout.rightMargin: 16 }
                     }
                 }
