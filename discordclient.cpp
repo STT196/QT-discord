@@ -29,6 +29,28 @@ static void log(const char *fmt, ...) {
     std::fprintf(stderr, "[discord] %s\n", buf);
 }
 
+// Build the member-list entry shape used by REST + gateway dispatches.
+static QVariantMap memberMap(const QJsonObject &d, const QHash<QString, QString> &presence) {
+    QJsonObject user = d.value("user").toObject();
+    QString id = user.value("id").toString();
+    QVariantMap m;
+    m["id"] = id;
+    m["username"] = user.value("username").toString();
+    m["global_name"] = user.value("global_name").toString();
+    m["avatar"] = user.value("avatar").toString();
+    m["nick"] = d.value("nick").toString();
+    m["roles"] = d.value("roles").toArray().toVariantList();
+    m["status"] = presence.value(id, QStringLiteral("offline"));
+    return m;
+}
+
+static int memberIndex(const QVariantList &list, const QString &id) {
+    for (int i = 0; i < list.size(); ++i)
+        if (list[i].toMap().value("id").toString() == id)
+            return i;
+    return -1;
+}
+
 DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
     connect(&m_nam, &QNetworkAccessManager::finished, this, &DiscordClient::onRestReply);
     connect(&m_sock, &QSslSocket::connected, this, &DiscordClient::onConnected);
@@ -149,6 +171,8 @@ void DiscordClient::selectGuild(const QString &guildId) {
         return;
     m_currentGuildId = guildId;
     m_currentChannelId.clear();
+    m_members.clear();
+    emit membersChanged();
     if (!m_typingText.isEmpty()) {
         m_typingText.clear();
         emit typingTextChanged();
@@ -167,6 +191,11 @@ void DiscordClient::selectGuild(const QString &guildId) {
 void DiscordClient::fetchGuildChannels(const QString &guildId) {
     m_restOp = GuildChannels;
     restGet(QString("/guilds/%1/channels").arg(guildId));
+}
+
+void DiscordClient::refreshMembers(const QString &guildId) {
+    m_restOp = GuildMembers;
+    restGet(QString("/guilds/%1/members?limit=100").arg(guildId));
 }
 
 void DiscordClient::restGet(const QString &path) {
@@ -537,6 +566,17 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         setStatus("DM opened.");
         m_restOp = None;
         refreshDms();
+        break;
+    }
+    case GuildMembers: {
+        QJsonArray arr = doc.array();
+        QVariantList list;
+        for (const QJsonValue &v : arr)
+            list.append(memberMap(v.toObject(), m_presence));
+        m_members = list;
+        emit membersChanged();
+        log("members=%d", arr.size());
+        m_restOp = None;
         break;
     }
     case SendMessage: {
@@ -937,6 +977,59 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
             recomputeTyping();
         m_typingTimer.start(8500);
         log("TYPING_START channel=%s user=%s (%s)", qPrintable(channelId), qPrintable(userId), qPrintable(name));
+        return;
+    }
+    if (t == "GUILD_MEMBER_ADD") {
+        QJsonObject md = d.toObject();
+        QJsonObject user = md.value("user").toObject();
+        QString id = user.value("id").toString();
+        if (memberIndex(m_members, id) < 0)
+            m_members.append(memberMap(md, m_presence));
+        emit membersChanged();
+        log("GUILD_MEMBER_ADD id=%s", qPrintable(id));
+        return;
+    }
+    if (t == "GUILD_MEMBER_UPDATE") {
+        QJsonObject md = d.toObject();
+        QJsonObject user = md.value("user").toObject();
+        QString id = user.value("id").toString();
+        int i = memberIndex(m_members, id);
+        if (i >= 0) {
+            QVariantMap m = m_members[i].toMap();
+            m["nick"] = md.value("nick").toString();
+            m["roles"] = md.value("roles").toArray().toVariantList();
+            m_members[i] = m;
+            emit membersChanged();
+        }
+        log("GUILD_MEMBER_UPDATE id=%s", qPrintable(id));
+        return;
+    }
+    if (t == "GUILD_MEMBER_REMOVE") {
+        QJsonObject md = d.toObject();
+        QJsonObject user = md.value("user").toObject();
+        QString id = user.value("id").toString();
+        int i = memberIndex(m_members, id);
+        if (i >= 0) {
+            m_members.removeAt(i);
+            emit membersChanged();
+        }
+        log("GUILD_MEMBER_REMOVE id=%s", qPrintable(id));
+        return;
+    }
+    if (t == "PRESENCE_UPDATE") {
+        QJsonObject md = d.toObject();
+        QJsonObject user = md.value("user").toObject();
+        QString id = user.value("id").toString();
+        QString status = md.value("status").toString();
+        m_presence[id] = status;
+        int i = memberIndex(m_members, id);
+        if (i >= 0) {
+            QVariantMap m = m_members[i].toMap();
+            m["status"] = status;
+            m_members[i] = m;
+            emit membersChanged();
+        }
+        log("PRESENCE_UPDATE id=%s status=%s", qPrintable(id), qPrintable(status));
         return;
     }
     if (t == "MESSAGE_REACTION_REMOVE_EMOJI") {
