@@ -10,6 +10,7 @@
 #include <QMap>
 #include <QHash>
 #include <QString>
+#include <QStringList>
 #include <QFile>
 #include <QFileInfo>
 #include <QHttpMultiPart>
@@ -110,6 +111,7 @@ private:
     void restPut(const QString &path);
     void restDelete(const QString &path);
     void fetchGuildChannels(const QString &guildId);
+    void fetchChannelAt(int index);
     void sendTextFrame(const QString &text);
     void sendOp(int op, const QJsonObject &d);
     void identify();
@@ -122,6 +124,9 @@ private:
     QString m_token;
     bool m_useBotPrefix = true;
     int m_intents = 513;
+    QStringList m_textChannels;
+    int m_textIndex = 0;
+    bool m_autoSelecting = false;
     QString m_status = "Connecting...";
     QString m_currentGuildId;
     QString m_currentChannelId;

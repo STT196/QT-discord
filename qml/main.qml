@@ -55,6 +55,26 @@ ApplicationWindow {
         return "https://cdn.discordapp.com/avatars/" + a["id"] + "/" + a["avatar"] + ".png?size=80";
     }
 
+    function guildIcon(g) {
+        if (!g || !g["icon"])
+            return "";
+        return "https://cdn.discordapp.com/icons/" + g["id"] + "/" + g["icon"] + ".png?size=96";
+    }
+
+    function isImageAttachment(att) {
+        if (!att)
+            return false;
+        var ct = att["content_type"] || "";
+        if (ct.indexOf("image") === 0)
+            return true;
+        var fn = (att["filename"] || "").toLowerCase();
+        return /\.(png|jpe?g|gif|webp|bmp)$/.test(fn);
+    }
+
+    function attachmentUrl(att) {
+        return att["proxy_url"] || att["url"] || "";
+    }
+
     function fmtTime(ts) {
         if (!ts) return "";
         var d = new Date(ts);
@@ -123,8 +143,17 @@ ApplicationWindow {
                             width: 48; height: 48
                             radius: client.currentGuildId === modelData.id ? 14 : 24
                             color: client.currentGuildId === modelData.id ? root.cAccent : root.cHover
+                            clip: true
+                            Image {
+                                anchors.fill: parent
+                                visible: modelData.icon && modelData.icon.length > 0
+                                source: root.guildIcon(modelData)
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                            }
                             Text {
                                 anchors.centerIn: parent
+                                visible: !(modelData.icon && modelData.icon.length > 0)
                                 text: modelData.name ? modelData.name[0].toUpperCase() : "?"
                                 color: "white"; font.pixelSize: 18; font.bold: true
                             }
@@ -374,18 +403,16 @@ ApplicationWindow {
                                     delegate: Item {
                                         Layout.fillWidth: true
                                         Layout.topMargin: 4
-                                        implicitHeight: {
-                                            var ct = modelData.content_type || "";
-                                            return ct.indexOf("image") === 0 ? 220 : 24;
-                                        }
+                                        implicitHeight: root.isImageAttachment(modelData) ? 220 : 24
                                         Image {
-                                            visible: (modelData.content_type || "").indexOf("image") === 0
-                                            source: modelData.url || ""
+                                            visible: root.isImageAttachment(modelData)
+                                            source: root.attachmentUrl(modelData)
                                             width: Math.min(parent.width, 320); height: 220
                                             fillMode: Image.PreserveAspectFit
+                                            asynchronous: true
                                         }
                                         Text {
-                                            visible: (modelData.content_type || "").indexOf("image") !== 0
+                                            visible: !root.isImageAttachment(modelData)
                                             text: "\uD83D\uDCCE " + (modelData.filename || "file")
                                             color: "#00a8fc"
                                             font.pixelSize: 13

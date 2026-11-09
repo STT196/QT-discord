@@ -97,6 +97,9 @@ DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
 void DiscordClient::login(const QString &token, bool useBot) {
     m_token = token;
     m_useBotPrefix = useBot;
+    m_autoSelecting = false;
+    m_textChannels.clear();
+    m_textIndex = 0;
     m_restOp = Me;
     setStatus("Logging in...");
     restGet("/users/@me");
@@ -221,6 +224,19 @@ void DiscordClient::fetchGuildChannels(const QString &guildId) {
     restGet(QString("/guilds/%1/channels").arg(guildId));
 }
 
+void DiscordClient::fetchChannelAt(int index) {
+    if (index < 0 || index >= m_textChannels.size()) {
+        m_autoSelecting = false;
+        setStatus("Connected. (no readable text channel)");
+        return;
+    }
+    m_textIndex = index;
+    m_currentChannelId = m_textChannels[index];
+    emit currentChannelIdChanged();
+    m_restOp = ChannelMessages;
+    restGet(QString("/channels/%1/messages?limit=25").arg(m_currentChannelId));
+}
+
 void DiscordClient::refreshMembers(const QString &guildId) {
     m_restOp = GuildMembers;
     restGet(QString("/guilds/%1/members?limit=100").arg(guildId));
@@ -343,6 +359,7 @@ void DiscordClient::sendFile(const QString &channelId, const QString &filePath, 
 }
 
 void DiscordClient::selectChannel(const QString &channelId) {
+    m_autoSelecting = false;
     if (channelId == m_currentChannelId)
         return;
     m_currentChannelId = channelId;
@@ -433,6 +450,12 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     if (reply->error() != QNetworkReply::NoError) {
         log("REST op=%d err=%d code=%d %s", (int)m_restOp, (int)reply->error(), http,
             qPrintable(reply->errorString()));
+        if (m_restOp == ChannelMessages && m_autoSelecting) {
+            log("auto-select: skipping unreadable channel %s (code %d)",
+                qPrintable(m_currentChannelId), http);
+            fetchChannelAt(m_textIndex + 1);
+            return;
+        }
         setStatus(QString("REST error: %1").arg(reply->errorString()));
         emit errorOccurred(reply->errorString());
         m_restOp = None;
@@ -461,6 +484,10 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
             m_restOp = None;
             setStatus(QString("Rate limited, retrying in %1 ms").arg(retryAfter));
             m_retryTimer.start(retryAfter);
+            return;
+        }
+        if (m_restOp == ChannelMessages && m_autoSelecting) {
+            fetchChannelAt(m_textIndex + 1);
             return;
         }
         setStatus(QString("REST HTTP %1").arg(http));
@@ -550,31 +577,18 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         m_channels = list;
         emit channelsChanged();
         log("channels=%d", list.size());
-        int realChannels = 0;
-        QString firstTextId;
+        m_textChannels.clear();
         for (const QVariant &v : list) {
             QVariantMap m = v.toMap();
-            int type = m.value("type").toInt();
-            if (type != 0 && type != 2)
-                continue;
-            ++realChannels;
-            if (type == 0 && firstTextId.isEmpty())
-                firstTextId = m.value("id").toString();
+            if (m.value("type").toInt() == 0)
+                m_textChannels.append(m.value("id").toString());
         }
-        if (realChannels == 0) {
-            setStatus("No channels.");
-            emit errorOccurred("No text channels in guild.");
-            return;
-        }
-        if (firstTextId.isEmpty()) {
-            // Only voice channels present; keep gateway alive, nothing to fetch.
+        if (m_textChannels.isEmpty()) {
             setStatus("No text channels.");
             break;
         }
-        m_currentChannelId = firstTextId;
-        emit currentChannelIdChanged();
-        m_restOp = ChannelMessages;
-        restGet(QString("/channels/%1/messages?limit=25").arg(firstTextId));
+        m_autoSelecting = true;
+        fetchChannelAt(0);
         break;
     }
     case ChannelMessages: {
@@ -587,6 +601,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         emit activeMessagesChanged();
         log("messages=%d in %s", arr.size(), qPrintable(m_currentChannelId));
         setStatus("Connected.");
+        m_autoSelecting = false;
         m_restOp = None;
         if (!m_gatewayStarted) {
             m_gatewayStarted = true;
