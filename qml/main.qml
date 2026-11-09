@@ -13,6 +13,29 @@ ApplicationWindow {
     property var client: discordClient
     property bool dmsLoaded: false
     readonly property bool loggedIn: !!client.user && !!client.user.id
+    property bool showMembers: true
+
+    readonly property var memberList: {
+        var arr = [];
+        for (var i = 0; i < client.members.length; ++i) arr.push(client.members[i]);
+        var rank = { online: 0, idle: 1, dnd: 2, offline: 3 };
+        arr.sort(function(a, b) {
+            var ra = (rank[a.status] !== undefined) ? rank[a.status] : 3;
+            var rb = (rank[b.status] !== undefined) ? rank[b.status] : 3;
+            if (ra !== rb) return ra - rb;
+            var na = ((a.nick || a.global_name || a.username || "") + "").toLowerCase();
+            var nb = ((b.nick || b.global_name || b.username || "") + "").toLowerCase();
+            return na < nb ? -1 : (na > nb ? 1 : 0);
+        });
+        return arr;
+    }
+
+    function statusColor(s) {
+        if (s === "online") return "#3ba55d";
+        if (s === "idle") return "#faa81a";
+        if (s === "dnd") return "#ed4245";
+        return "#80848e";
+    }
 
     // Discord dark palette
     readonly property color cRail: "#1e1f22"
@@ -233,6 +256,7 @@ ApplicationWindow {
                             font.bold: true
                             Layout.fillWidth: true
                         }
+                        Button { text: "Members"; implicitHeight: 28; onClicked: root.showMembers = !root.showMembers }
                         Text { text: client.status; color: root.cMuted; font.pixelSize: 12; Layout.rightMargin: 16 }
                     }
                 }
@@ -412,6 +436,76 @@ ApplicationWindow {
                 }
             }
         }
+
+        // ---- Member list ----
+        Rectangle {
+            Layout.preferredWidth: root.showMembers ? 220 : 0
+            Layout.fillHeight: true
+            visible: root.showMembers
+            color: root.cSidebar
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 14
+                    Layout.rightMargin: 8
+                    Layout.topMargin: 10
+                    Text {
+                        text: "MEMBERS — " + client.members.length
+                        color: root.cMuted
+                        font.pixelSize: 11
+                        font.bold: true
+                        Layout.fillWidth: true
+                    }
+                    Button { text: "\u21BB"; implicitWidth: 26; implicitHeight: 24; onClicked: client.refreshMembers(client.currentGuildId) }
+                }
+
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    model: root.memberList
+                    delegate: Item {
+                        width: ListView.view.width
+                        height: 42
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 8
+                            spacing: 8
+                            Item {
+                                Layout.preferredWidth: 30
+                                Layout.preferredHeight: 30
+                                Image {
+                                    anchors.fill: parent
+                                    source: root.avatar(modelData)
+                                    fillMode: Image.PreserveAspectCrop
+                                }
+                                Rectangle {
+                                    width: 11; height: 11; radius: 6
+                                    anchors.right: parent.right
+                                    anchors.bottom: parent.bottom
+                                    color: root.statusColor(modelData.status)
+                                    border.width: 2
+                                    border.color: root.cSidebar
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: (modelData.nick && modelData.nick.length > 0) ? modelData.nick
+                                      : ((modelData.global_name && modelData.global_name.length > 0) ? modelData.global_name : modelData.username)
+                                color: (modelData.status === "offline") ? root.cMuted : root.cText
+                                font.pixelSize: 13
+                                elide: Text.ElideRight
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- Login page ----
@@ -492,13 +586,25 @@ ApplicationWindow {
         messageInput.text = "";
     }
 
+    Timer {
+        id: membersTimer
+        interval: 2000
+        repeat: false
+        onTriggered: if (client.loggedIn && client.currentGuildId.length > 0) client.refreshMembers(client.currentGuildId)
+    }
+
     Connections {
         target: client
         function onStatusChanged() {
             if (client.status === "Connected." && !root.dmsLoaded) {
                 root.dmsLoaded = true;
                 client.refreshDms();
+                membersTimer.start();
             }
+        }
+        function onCurrentGuildIdChanged() {
+            if (client.currentGuildId.length > 0 && client.status === "Connected.")
+                client.refreshMembers(client.currentGuildId);
         }
     }
 }
