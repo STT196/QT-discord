@@ -178,17 +178,36 @@ ApplicationWindow {
                     model: client.channels
                     delegate: Rectangle {
                         width: ListView.view.width
-                        height: 32
+                        height: modelData.type === 4 ? 36 : 32
                         radius: 4
-                        color: client.currentChannelId === modelData.id ? root.cActive : (chHover.containsMouse ? root.cHover : "transparent")
+                        color: modelData.type === 4 ? "transparent"
+                             : (client.currentChannelId === modelData.id ? root.cActive : (chHover.containsMouse ? root.cHover : "transparent"))
                         RowLayout {
                             anchors.fill: parent
                             anchors.leftMargin: 10
                             spacing: 6
-                            Text { text: "#"; color: root.cMuted; font.pixelSize: 16 }
-                            Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideRight; Layout.fillWidth: true }
+                            if (modelData.type === 4) {
+                                Text {
+                                    text: modelData.name.toUpperCase()
+                                    color: root.cMuted
+                                    font.pixelSize: 12
+                                    font.bold: true
+                                }
+                            } else if (modelData.type === 2) {
+                                Text { text: "\uD83D\uDD0A"; color: root.cMuted; font.pixelSize: 16 }
+                                Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideRight; Layout.fillWidth: true }
+                            } else {
+                                Text { text: "#"; color: root.cMuted; font.pixelSize: 16 }
+                                Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideRight; Layout.fillWidth: true }
+                            }
                         }
-                        MouseArea { id: chHover; anchors.fill: parent; hoverEnabled: true; onClicked: client.selectChannel(modelData.id) }
+                        MouseArea {
+                            id: chHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            enabled: modelData.type !== 4 && modelData.type !== 2
+                            onClicked: client.selectChannel(modelData.id)
+                        }
                     }
                 }
 

@@ -19,6 +19,7 @@
 #include <QRegularExpression>
 #include <algorithm>
 #include <vector>
+#include <climits>
 #include <cstdio>
 
 static void log(const char *fmt, ...) {
@@ -28,6 +29,28 @@ static void log(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
     std::fprintf(stderr, "[discord] %s\n", buf);
+}
+
+static int channelPosition(const QJsonObject &o) {
+    QJsonValue p = o.value("position");
+    if (p.isUndefined() || p.isNull())
+        return INT_MAX;
+    return p.toInt();
+}
+
+static QJsonArray sortChannels(const QJsonArray &arr) {
+    std::vector<QJsonValue> vec;
+    vec.reserve(arr.size());
+    for (const QJsonValue &v : arr)
+        vec.push_back(v);
+    std::sort(vec.begin(), vec.end(),
+              [](const QJsonValue &a, const QJsonValue &b) {
+                  return channelPosition(a.toObject()) < channelPosition(b.toObject());
+              });
+    QJsonArray out;
+    for (const QJsonValue &v : vec)
+        out.append(v);
+    return out;
 }
 
 // Build the member-list entry shape used by REST + gateway dispatches.
@@ -484,25 +507,63 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     }
     case GuildChannels: {
         QJsonArray arr = doc.array();
-        QVariantList list;
+        QHash<QString, QJsonObject> categories;
+        QHash<QString, QJsonArray> children;
+        QJsonArray uncategorized;
         for (const QJsonValue &v : arr) {
             QJsonObject o = v.toObject();
-            if (o.value("type").toInt() == 0) // text channel only
-                list.append(o.toVariantMap());
+            int type = o.value("type").toInt();
+            if (type != 0 && type != 2 && type != 4)
+                continue;
+            if (type == 4) {
+                categories.insert(o.value("id").toString(), o);
+            } else {
+                QString pid = o.value("parent_id").toString();
+                if (pid.isEmpty())
+                    uncategorized.append(o);
+                else
+                    children[pid].append(o);
+            }
         }
+        QList<QJsonObject> catList = categories.values();
+        std::sort(catList.begin(), catList.end(),
+                  [](const QJsonObject &a, const QJsonObject &b) {
+                      return channelPosition(a) < channelPosition(b);
+                  });
+        QVariantList list;
+        for (const QJsonObject &cat : catList) {
+            list.append(cat.toVariantMap());
+            QString cid = cat.value("id").toString();
+            QJsonArray ch = sortChannels(children.value(cid));
+            for (const QJsonValue &cv : ch)
+                list.append(cv.toObject().toVariantMap());
+        }
+        QJsonArray uncat = sortChannels(uncategorized);
+        for (const QJsonValue &cv : uncat)
+            list.append(cv.toObject().toVariantMap());
         m_channels = list;
         emit channelsChanged();
         log("channels=%d", list.size());
-        if (list.isEmpty()) {
+        int realChannels = 0;
+        QString firstId;
+        for (const QVariant &v : list) {
+            QVariantMap m = v.toMap();
+            int type = m.value("type").toInt();
+            if (type != 0 && type != 2)
+                continue;
+            ++realChannels;
+            if (firstId.isEmpty())
+                firstId = m.value("id").toString();
+        }
+        if (realChannels == 0) {
             setStatus("No text channels.");
             emit errorOccurred("No text channels in guild.");
             return;
         }
-        QString cid = list[0].toMap().value("id").toString();
-        m_currentChannelId = cid;
+        m_currentChannelId = firstId;
         emit currentChannelIdChanged();
         m_restOp = ChannelMessages;
-        restGet(QString("/channels/%1/messages?limit=25").arg(cid));
+        restGet(QString("/channels/%1/messages?limit=25").arg(firstId));
         break;
     }
     case ChannelMessages: {
