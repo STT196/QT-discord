@@ -186,19 +186,24 @@ ApplicationWindow {
                             anchors.fill: parent
                             anchors.leftMargin: 10
                             spacing: 6
-                            if (modelData.type === 4) {
-                                Text {
-                                    text: modelData.name.toUpperCase()
-                                    color: root.cMuted
-                                    font.pixelSize: 12
-                                    font.bold: true
-                                }
-                            } else if (modelData.type === 2) {
-                                Text { text: "\uD83D\uDD0A"; color: root.cMuted; font.pixelSize: 16 }
-                                Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideRight; Layout.fillWidth: true }
-                            } else {
-                                Text { text: "#"; color: root.cMuted; font.pixelSize: 16 }
-                                Text { text: modelData.name; color: root.cText; font.pixelSize: 14; elide: Text.ElideRight; Layout.fillWidth: true }
+                            Text {
+                                visible: modelData.type === 4
+                                text: modelData.name.toUpperCase()
+                                color: root.cMuted
+                                font.pixelSize: 12
+                                font.bold: true
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                            }
+                            Text { visible: modelData.type === 0; text: "#"; color: root.cMuted; font.pixelSize: 16 }
+                            Text { visible: modelData.type === 2; text: "\uD83D\uDD0A"; color: root.cMuted; font.pixelSize: 16 }
+                            Text {
+                                visible: modelData.type !== 4
+                                text: modelData.name
+                                color: root.cText
+                                font.pixelSize: 14
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
                         }
                         MouseArea {
@@ -289,6 +294,7 @@ ApplicationWindow {
                     clip: true
                     model: client.activeMessages
                     spacing: 2
+                    onCountChanged: positionViewAtEnd()
                     delegate: Rectangle {
                         width: messageView.width
                         height: msgLayout.implicitHeight + 12

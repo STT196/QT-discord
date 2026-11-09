@@ -485,6 +485,12 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         setStatus("Fetching guilds...");
         m_restOp = MyGuilds;
         restGet("/users/@me/guilds");
+        // Start the gateway now that auth succeeded — independent of REST bootstrap,
+        // so realtime events flow even if a later channel/message fetch fails.
+        if (!m_gatewayStarted) {
+            m_gatewayStarted = true;
+            connectGateway();
+        }
         break;
     }
     case MyGuilds: {
@@ -545,25 +551,30 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         emit channelsChanged();
         log("channels=%d", list.size());
         int realChannels = 0;
-        QString firstId;
+        QString firstTextId;
         for (const QVariant &v : list) {
             QVariantMap m = v.toMap();
             int type = m.value("type").toInt();
             if (type != 0 && type != 2)
                 continue;
             ++realChannels;
-            if (firstId.isEmpty())
-                firstId = m.value("id").toString();
+            if (type == 0 && firstTextId.isEmpty())
+                firstTextId = m.value("id").toString();
         }
         if (realChannels == 0) {
-            setStatus("No text channels.");
+            setStatus("No channels.");
             emit errorOccurred("No text channels in guild.");
             return;
         }
-        m_currentChannelId = firstId;
+        if (firstTextId.isEmpty()) {
+            // Only voice channels present; keep gateway alive, nothing to fetch.
+            setStatus("No text channels.");
+            break;
+        }
+        m_currentChannelId = firstTextId;
         emit currentChannelIdChanged();
         m_restOp = ChannelMessages;
-        restGet(QString("/channels/%1/messages?limit=25").arg(firstId));
+        restGet(QString("/channels/%1/messages?limit=25").arg(firstTextId));
         break;
     }
     case ChannelMessages: {
