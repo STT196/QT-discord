@@ -42,11 +42,14 @@ DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
     m_retryTimer.setSingleShot(true);
     connect(&m_typingTimer, &QTimer::timeout, this, &DiscordClient::pruneTyping);
     m_typingTimer.setSingleShot(true);
+}
 
-    // Bootstrap: who am I?
-    restGet("/users/@me");
+void DiscordClient::login(const QString &token, bool useBot) {
+    m_token = token;
+    m_useBotPrefix = useBot;
     m_restOp = Me;
     setStatus("Logging in...");
+    restGet("/users/@me");
 }
 
 void DiscordClient::setToken(const QString &token) { m_token = token; }

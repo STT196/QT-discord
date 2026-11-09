@@ -12,6 +12,7 @@ ApplicationWindow {
 
     property var client: discordClient
     property bool dmsLoaded: false
+    readonly property bool loggedIn: !!client.user && !!client.user.id
 
     // Discord dark palette
     readonly property color cRail: "#1e1f22"
@@ -58,6 +59,7 @@ ApplicationWindow {
     RowLayout {
         anchors.fill: parent
         spacing: 0
+        visible: root.loggedIn
 
         // ---- Guild rail ----
         Rectangle {
@@ -412,6 +414,61 @@ ApplicationWindow {
         }
     }
 
+    // ---- Login page ----
+    Rectangle {
+        anchors.fill: parent
+        visible: !root.loggedIn
+        color: root.cRail
+
+        Rectangle {
+            width: 440
+            height: loginCol.implicitHeight + 64
+            anchors.centerIn: parent
+            radius: 10
+            color: root.cSidebar
+
+            ColumnLayout {
+                id: loginCol
+                anchors.fill: parent
+                anchors.margins: 32
+                spacing: 14
+
+                Text { text: "Welcome back!"; color: root.cText; font.pixelSize: 24; font.bold: true; Layout.alignment: Qt.AlignHCenter }
+                Text { text: "Log in with your Discord token"; color: root.cMuted; font.pixelSize: 13; Layout.alignment: Qt.AlignHCenter }
+
+                TextField {
+                    id: tokenInput
+                    Layout.fillWidth: true
+                    placeholderText: "Token"
+                    echoMode: TextInput.Password
+                    color: root.cText
+                    onAccepted: root.doLogin()
+                }
+
+                CheckBox {
+                    id: userTokenCheck
+                    text: "Use user token (self-bot — may violate ToS)"
+                }
+
+                Button {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 40
+                    text: "Log In"
+                    enabled: tokenInput.text.length > 0
+                    onClicked: root.doLogin()
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: client.status
+                    color: root.cMuted
+                    font.pixelSize: 12
+                    wrapMode: Text.Wrap
+                }
+            }
+        }
+    }
+
     FileDialog {
         id: fileDialog
         title: "Upload a file"
@@ -420,6 +477,12 @@ ApplicationWindow {
             client.sendFile(client.currentChannelId, p, messageInput.text);
             messageInput.text = "";
         }
+    }
+
+    function doLogin() {
+        if (tokenInput.text.trim().length === 0)
+            return;
+        client.login(tokenInput.text, !userTokenCheck.checked);
     }
 
     function send() {

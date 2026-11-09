@@ -36,23 +36,19 @@ int main(int argc, char **argv) {
             else fprintf(stderr, "Ignoring non-numeric --intents value\n");
         }
     }
-    if (token.isEmpty()) {
-        fprintf(stderr, "No token provided. Use --token <token> or set DISCORD_TOKEN env var.\n");
-        fprintf(stderr, "Add --user for a user token (raw Authorization header), omit for bot tokens.\n");
-        return 1;
-    }
-
     DiscordClient client;
-    client.setToken(token);
-    client.setUseBotPrefix(useBotPrefix);
     client.setIntents(intents);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("discordClient", &client);
-    engine.load(QUrl::fromLocalFile(QStringLiteral("qml/main.qml")));
+    engine.load(QUrl(QStringLiteral("qrc:/qml/qml/main.qml")));
 
     if (engine.rootObjects().isEmpty())
         return -1;
+
+    // Auto-login only if a token was supplied; otherwise the QML login page is shown.
+    if (!token.isEmpty())
+        client.login(token, useBotPrefix);
 
     return app.exec();
 }
