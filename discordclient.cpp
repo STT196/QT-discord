@@ -10,6 +10,8 @@
 #include <QUrl>
 #include <QDateTime>
 #include <QCoreApplication>
+#include <QGuiApplication>
+#include <QClipboard>
 #include <QSettings>
 #include <QFile>
 #include <QFileInfo>
@@ -21,6 +23,10 @@
 #include <vector>
 #include <climits>
 #include <cstdio>
+#include <QtMath>
+#include <QBuffer>
+#include <QAudioSink>
+#include <QAudioFormat>
 
 static void log(const char *fmt, ...) {
     va_list args;
@@ -68,11 +74,62 @@ static QVariantMap memberMap(const QJsonObject &d, const QHash<QString, QString>
     return m;
 }
 
+void DiscordClient::rememberUser(const QJsonObject &user) {
+    const QString id = user.value("id").toString();
+    if (id.isEmpty())
+        return;
+    QString name = user.value("global_name").toString();
+    if (name.isEmpty())
+        name = user.value("username").toString();
+    if (!name.isEmpty())
+        m_userNames[id] = name;
+}
+
+void DiscordClient::rememberMessageUsers(const QJsonArray &messages) {
+    for (const QJsonValue &v : messages) {
+        const QJsonObject msg = v.toObject();
+        rememberUser(msg.value("author").toObject());
+        const QJsonArray mentions = msg.value("mentions").toArray();
+        for (const QJsonValue &mv : mentions)
+            rememberUser(mv.toObject());
+    }
+}
+
 static int memberIndex(const QVariantList &list, const QString &id) {
     for (int i = 0; i < list.size(); ++i)
         if (list[i].toMap().value("id").toString() == id)
             return i;
     return -1;
+}
+
+static QVariantMap voiceParticipantMap(const QJsonObject &d) {
+    QJsonObject member = d.value("member").toObject();
+    QJsonObject user = member.value("user").toObject();
+    QString id = d.value("user_id").toString();
+    if (id.isEmpty())
+        id = user.value("id").toString();
+    QString name = member.value("nick").toString();
+    if (name.isEmpty())
+        name = user.value("global_name").toString();
+    if (name.isEmpty())
+        name = user.value("username").toString();
+    if (name.isEmpty())
+        name = id;
+    QString avatar = user.value("avatar").toString();
+    QVariantMap m;
+    m["userId"] = id;
+    m["guildId"] = d.value("guild_id").toString();
+    m["channelId"] = d.value("channel_id").toString();
+    m["name"] = name;
+    m["avatar"] = avatar;
+    m["avatarUrl"] = avatar.isEmpty()
+            ? QStringLiteral("https://cdn.discordapp.com/embed/avatars/0.png")
+            : QString("https://cdn.discordapp.com/avatars/%1/%2.png?size=64").arg(id, avatar);
+    m["selfMute"] = d.value("self_mute").toBool();
+    m["selfDeaf"] = d.value("self_deaf").toBool();
+    m["mute"] = d.value("mute").toBool() || d.value("self_mute").toBool();
+    m["deaf"] = d.value("deaf").toBool() || d.value("self_deaf").toBool();
+    return m;
 }
 
 DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
@@ -86,12 +143,26 @@ DiscordClient::DiscordClient(QObject *parent) : QObject(parent) {
     connect(&m_hbTimer, &QTimer::timeout, this, &DiscordClient::onHeartbeat);
     connect(&m_retryTimer, &QTimer::timeout, this, &DiscordClient::doRetry);
     m_retryTimer.setSingleShot(true);
+    connect(&m_reconnectTimer, &QTimer::timeout, this, &DiscordClient::doReconnect);
+    m_reconnectTimer.setSingleShot(true);
     connect(&m_typingTimer, &QTimer::timeout, this, &DiscordClient::pruneTyping);
     m_typingTimer.setSingleShot(true);
+    connect(&m_voice, &VoiceClient::statusChanged, this, &DiscordClient::voiceStatusChanged);
+    connect(&m_voice, &VoiceClient::connectedChanged, this, &DiscordClient::voiceChanged);
+    connect(&m_voice, &VoiceClient::connectedChanged, this, [this]() {
+        if (m_voice.isConnected())
+            playTone(800, 160);   // voice connected chime
+    });
+    connect(&m_voice, &VoiceClient::errorOccurred, this, &DiscordClient::voiceError);
 
     m_theme = QSettings("QtDiscord", "QtDiscord").value("theme", "dark").toString();
     if (m_theme != "light" && m_theme != "dark")
         m_theme = "dark";
+
+    m_soundboardOutput = new QAudioOutput(this);
+    m_soundboardPlayer = new QMediaPlayer(this);
+    m_soundboardPlayer->setAudioOutput(m_soundboardOutput);
+    m_soundboardOutput->setVolume(0.8);
 }
 
 void DiscordClient::login(const QString &token, bool useBot) {
@@ -100,6 +171,8 @@ void DiscordClient::login(const QString &token, bool useBot) {
     m_autoSelecting = false;
     m_textChannels.clear();
     m_textIndex = 0;
+    if (!m_unread.isEmpty()) { m_unread.clear(); emit unreadChanged(); }
+    if (!m_pins.isEmpty()) { m_pins.clear(); emit pinsChanged(); }
     m_restOp = Me;
     setStatus("Logging in...");
     restGet("/users/@me");
@@ -120,6 +193,13 @@ void DiscordClient::loadMoreMessages() {
     QString before = it.value().last().toObject().value("id").toString();
     m_restOp = ChannelMessagesMore;
     restGet(QString("/channels/%1/messages?before=%2&limit=50").arg(m_currentChannelId, before));
+}
+
+void DiscordClient::fetchPins(const QString &channelId) {
+    if (channelId.isEmpty())
+        return;
+    m_restOp = ChannelPins;
+    restGet(QString("/channels/%1/pins").arg(channelId));
 }
 
 void DiscordClient::recomputeTyping() {
@@ -164,6 +244,7 @@ void DiscordClient::pruneTyping() {
 }
 
 void DiscordClient::doRetry() {
+    m_restOp = m_retryOp;
     switch (m_retryMethod) {
     case Post:
         restPost(m_retryPath, m_retryBody);
@@ -187,6 +268,7 @@ void DiscordClient::doRetry() {
 }
 
 void DiscordClient::connectGateway() {
+    m_fatalClose = false;
     QUrl gw("wss://gateway.discord.gg/?v=10&encoding=json");
     m_handshakeHost = gw.host();
     m_handshakePath = gw.path();
@@ -194,11 +276,29 @@ void DiscordClient::connectGateway() {
         m_handshakePath += "?" + gw.query();
     m_sock.connectToHostEncrypted(m_handshakeHost, gw.port(443));
     m_inHttp = true;
+    m_buffer.clear();
     setStatus("Connecting gateway...");
 }
 
+void DiscordClient::doReconnect() {
+    connectGateway();
+}
+
+void DiscordClient::scheduleReconnect() {
+    if (!m_gatewayStarted)
+        return;
+    if (m_reconnectTimer.isActive())
+        return;
+    int delay = 1000 << qMin(m_reconnectAttempt, 4);
+    if (delay > 30000)
+        delay = 30000;
+    ++m_reconnectAttempt;
+    log("Scheduling reconnect in %d ms (attempt %d)", delay, m_reconnectAttempt);
+    m_reconnectTimer.start(delay);
+}
+
 void DiscordClient::selectGuild(const QString &guildId) {
-    if (guildId == m_currentGuildId)
+    if (guildId == m_currentGuildId && !m_channels.isEmpty())
         return;
     m_currentGuildId = guildId;
     m_currentChannelId.clear();
@@ -242,6 +342,15 @@ void DiscordClient::refreshMembers(const QString &guildId) {
     restGet(QString("/guilds/%1/members?limit=100").arg(guildId));
 }
 
+void DiscordClient::stampRest(QNetworkReply *reply, RestOp op, const QString &path,
+                              const QJsonObject &body, bool isPost, RestMethod method) {
+    reply->setProperty("restOp", (int)op);
+    reply->setProperty("restPath", path);
+    reply->setProperty("restBody", QJsonDocument(body).toJson(QJsonDocument::Compact));
+    reply->setProperty("restIsPost", isPost);
+    reply->setProperty("restMethod", (int)method);
+}
+
 void DiscordClient::restGet(const QString &path) {
     QUrl url(QString("https://discord.com/api%1").arg(path));
     QNetworkRequest req(url);
@@ -249,11 +358,8 @@ void DiscordClient::restGet(const QString &path) {
     req.setRawHeader("Authorization", authHeader.toLatin1());
     req.setRawHeader("User-Agent", "QtDiscord/0.1");
     req.setRawHeader("Accept", "application/json");
-    m_lastRestPath = path;
-    m_lastRestBody = QJsonObject();
-    m_lastRestIsPost = false;
-    m_lastRestMethod = Get;
-    m_nam.get(req);
+    QNetworkReply *reply = m_nam.get(req);
+    stampRest(reply, m_restOp, path, QJsonObject(), false, Get);
 }
 
 void DiscordClient::restPost(const QString &path, const QJsonObject &body) {
@@ -264,11 +370,8 @@ void DiscordClient::restPost(const QString &path, const QJsonObject &body) {
     req.setRawHeader("User-Agent", "QtDiscord/0.1");
     req.setRawHeader("Content-Type", "application/json");
     QByteArray data = QJsonDocument(body).toJson(QJsonDocument::Compact);
-    m_lastRestPath = path;
-    m_lastRestBody = body;
-    m_lastRestIsPost = true;
-    m_lastRestMethod = Post;
-    m_nam.post(req, data);
+    QNetworkReply *reply = m_nam.post(req, data);
+    stampRest(reply, m_restOp, path, body, true, Post);
 }
 
 void DiscordClient::restPut(const QString &path) {
@@ -278,11 +381,8 @@ void DiscordClient::restPut(const QString &path) {
     req.setRawHeader("Authorization", authHeader.toLatin1());
     req.setRawHeader("User-Agent", "QtDiscord/0.1");
     req.setRawHeader("Content-Type", "application/json");
-    m_lastRestPath = path;
-    m_lastRestBody = QJsonObject();
-    m_lastRestIsPost = false;
-    m_lastRestMethod = Put;
-    m_nam.put(req, QByteArray());
+    QNetworkReply *reply = m_nam.put(req, QByteArray());
+    stampRest(reply, m_restOp, path, QJsonObject(), false, Put);
 }
 
 void DiscordClient::restDelete(const QString &path) {
@@ -291,11 +391,20 @@ void DiscordClient::restDelete(const QString &path) {
     QString authHeader = m_useBotPrefix ? QString("Bot %1").arg(m_token) : m_token;
     req.setRawHeader("Authorization", authHeader.toLatin1());
     req.setRawHeader("User-Agent", "QtDiscord/0.1");
-    m_lastRestPath = path;
-    m_lastRestBody = QJsonObject();
-    m_lastRestIsPost = false;
-    m_lastRestMethod = Delete;
-    m_nam.deleteResource(req);
+    QNetworkReply *reply = m_nam.deleteResource(req);
+    stampRest(reply, m_restOp, path, QJsonObject(), false, Delete);
+}
+
+void DiscordClient::restPatch(const QString &path, const QJsonObject &body) {
+    QUrl url(QString("https://discord.com/api%1").arg(path));
+    QNetworkRequest req(url);
+    QString authHeader = m_useBotPrefix ? QString("Bot %1").arg(m_token) : m_token;
+    req.setRawHeader("Authorization", authHeader.toLatin1());
+    req.setRawHeader("User-Agent", "QtDiscord/0.1");
+    req.setRawHeader("Content-Type", "application/json");
+    QByteArray data = QJsonDocument(body).toJson(QJsonDocument::Compact);
+    QNetworkReply *reply = m_nam.sendCustomRequest(req, "PATCH", data);
+    stampRest(reply, m_restOp, path, body, true, Patch);
 }
 
 void DiscordClient::sendMessage(const QString &channelId, const QString &content) {
@@ -356,14 +465,23 @@ void DiscordClient::sendFile(const QString &channelId, const QString &filePath, 
     QNetworkReply *reply = m_nam.post(req, multiPart);
     multiPart->setParent(reply);
     file->setParent(reply);
+    stampRest(reply, SendFile, QString("/channels/%1/messages").arg(channelId),
+              QJsonObject(), true, Post);
 }
 
 void DiscordClient::selectChannel(const QString &channelId) {
     m_autoSelecting = false;
     if (channelId == m_currentChannelId)
         return;
+    if (m_unread.remove(channelId) > 0)
+        emit unreadChanged();
     m_currentChannelId = channelId;
     emit currentChannelIdChanged();
+    updateCurrentChannelIsDm();
+    if (!m_pins.isEmpty()) {
+        m_pins.clear();
+        emit pinsChanged();
+    }
     recomputeTyping();
     if (!m_messageCache.contains(channelId)) {
         m_restOp = ChannelMessages;
@@ -371,6 +489,21 @@ void DiscordClient::selectChannel(const QString &channelId) {
     } else {
         m_activeMessages = activeMessagesFrom(channelId);
         emit activeMessagesChanged();
+    }
+}
+
+void DiscordClient::updateCurrentChannelIsDm() {
+    bool isDm = false;
+    for (const QVariant &v : m_dmChannels) {
+        QVariantMap m = v.toMap();
+        if (m.value("id").toString() == m_currentChannelId) {
+            isDm = true;
+            break;
+        }
+    }
+    if (m_currentChannelIsDm != isDm) {
+        m_currentChannelIsDm = isDm;
+        emit currentChannelIsDmChanged();
     }
 }
 
@@ -392,6 +525,19 @@ void DiscordClient::setTheme(const QString &t) {
     m_theme = t;
     QSettings("QtDiscord", "QtDiscord").setValue("theme", t);
     emit themeChanged();
+}
+
+void DiscordClient::copyToClipboard(const QString &text)
+{
+    QGuiApplication::clipboard()->setText(text);
+}
+
+QStringList DiscordClient::unreadChannelIds() const {
+    QStringList out;
+    out.reserve(m_unread.size());
+    for (const QString &id : m_unread)
+        out.append(id);
+    return out;
 }
 
 void DiscordClient::setStatus(const QString &s) {
@@ -445,29 +591,35 @@ void DiscordClient::normalizeMessages(QJsonArray &arr) const {
 void DiscordClient::onRestReply(QNetworkReply *reply) {
     const QByteArray data = reply->readAll();
     const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    const RestOp op = static_cast<RestOp>(reply->property("restOp").toInt());
+    const QString path = reply->property("restPath").toString();
     reply->deleteLater();
 
     if (reply->error() != QNetworkReply::NoError) {
-        log("REST op=%d err=%d code=%d %s", (int)m_restOp, (int)reply->error(), http,
+        log("REST op=%d err=%d code=%d %s", (int)op, (int)reply->error(), http,
             qPrintable(reply->errorString()));
-        if (m_restOp == ChannelMessages && m_autoSelecting) {
+        if (op == ChannelMessages && m_autoSelecting) {
             log("auto-select: skipping unreadable channel %s (code %d)",
                 qPrintable(m_currentChannelId), http);
             fetchChannelAt(m_textIndex + 1);
             return;
         }
+        if (op == DmCall) {
+            log("ring POST failed code=%d %s", http, qPrintable(reply->errorString()));
+            setStatus(QStringLiteral("Call joined; ring notification failed (HTTP %1).").arg(http));
+            m_restOp = None;
+            return;
+        }
         setStatus(QString("REST error: %1").arg(reply->errorString()));
         emit errorOccurred(reply->errorString());
-        m_restOp = None;
         return;
     }
     if (http < 200 || http >= 300) {
-        log("REST op=%d http=%d", (int)m_restOp, http);
+        log("REST op=%d http=%d", (int)op, http);
         if (http == 429) {
-        if (m_restOp == SendFile) {
-            log("REST op=%d http=429 (multipart, no retry)", (int)m_restOp);
+        if (op == SendFile) {
+            log("REST op=%d http=429 (multipart, no retry)", (int)op);
             setStatus("File upload rate limited.");
-            m_restOp = None;
             return;
         }
             int retryAfter = 5000;
@@ -476,37 +628,35 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
                 retryAfter = doc.object().value("retry_after").toInt(retryAfter);
             if (retryAfter < 1000)
                 retryAfter = 1000;
-            m_retryPath = m_lastRestPath;
-            m_retryBody = m_lastRestBody;
-            m_retryIsPost = m_lastRestIsPost;
-            m_retryMethod = m_lastRestMethod;
-            m_retryOp = m_restOp;
-            m_restOp = None;
+            m_retryPath = path;
+            m_retryBody = QJsonDocument::fromJson(reply->property("restBody").toByteArray()).object();
+            m_retryIsPost = reply->property("restIsPost").toBool();
+            m_retryMethod = static_cast<RestMethod>(reply->property("restMethod").toInt());
+            m_retryOp = op;
             setStatus(QString("Rate limited, retrying in %1 ms").arg(retryAfter));
             m_retryTimer.start(retryAfter);
             return;
         }
-        if (m_restOp == ChannelMessages && m_autoSelecting) {
+        if (op == ChannelMessages && m_autoSelecting) {
             fetchChannelAt(m_textIndex + 1);
             return;
         }
         setStatus(QString("REST HTTP %1").arg(http));
         emit errorOccurred(QString("HTTP %1").arg(http));
-        m_restOp = None;
         return;
     }
 
     QJsonDocument doc = QJsonDocument::fromJson(data);
     if (doc.isNull()) {
-        log("REST op=%d invalid json", (int)m_restOp);
-        m_restOp = None;
+        log("REST op=%d invalid json", (int)op);
         return;
     }
 
-    switch (m_restOp) {
+    switch (op) {
     case Me: {
         m_user = doc.object();
         m_selfId = m_user.value("id").toString();
+        rememberUser(m_user);
         emit userChanged();
         log("logged in as %s (id=%s)", qPrintable(m_user.value("username").toString()), qPrintable(m_selfId));
         setStatus("Fetching guilds...");
@@ -571,7 +721,14 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
             for (const QJsonValue &cv : ch)
                 list.append(cv.toObject().toVariantMap());
         }
-        QJsonArray uncat = sortChannels(uncategorized);
+        QJsonArray uncat = uncategorized;
+        for (auto it = children.constBegin(); it != children.constEnd(); ++it) {
+            if (!categories.contains(it.key())) {
+                for (const QJsonValue &cv : it.value())
+                    uncat.append(cv);
+            }
+        }
+        uncat = sortChannels(uncat);
         for (const QJsonValue &cv : uncat)
             list.append(cv.toObject().toVariantMap());
         m_channels = list;
@@ -593,16 +750,26 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     }
     case ChannelMessages: {
         QJsonArray arr = doc.array();
+        rememberMessageUsers(arr);
         normalizeMessages(arr);
-        m_messageCache[m_currentChannelId] = arr;
+        QString cid = m_currentChannelId;
+        const int cs = path.indexOf("/channels/");
+        if (cs >= 0) {
+            const int from = cs + 10;
+            const int to = path.indexOf('/', from);
+            if (to > from)
+                cid = path.mid(from, to - from);
+        }
+        m_messageCache[cid] = arr;
+        log("messages=%d in %s", arr.size(), qPrintable(cid));
+        if (cid != m_currentChannelId)
+            break;
         m_messages = arr.toVariantList();
         emit messagesChanged();
-        m_activeMessages = activeMessagesFrom(m_currentChannelId);
+        m_activeMessages = activeMessagesFrom(cid);
         emit activeMessagesChanged();
-        log("messages=%d in %s", arr.size(), qPrintable(m_currentChannelId));
         setStatus("Connected.");
         m_autoSelecting = false;
-        m_restOp = None;
         if (!m_gatewayStarted) {
             m_gatewayStarted = true;
             connectGateway();
@@ -611,6 +778,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     }
     case ChannelMessagesMore: {
         QJsonArray arr = doc.array();
+        rememberMessageUsers(arr);
         QJsonArray existing = m_messageCache.value(m_currentChannelId);
         for (int i = arr.size() - 1; i >= 0; --i)
             existing.prepend(arr[i]);
@@ -641,6 +809,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
                 QStringList names;
                 for (const QJsonValue &rv : recipients) {
                     QJsonObject ru = rv.toObject();
+                    rememberUser(ru);
                     QString rn = ru.value("global_name").toString();
                     if (rn.isEmpty())
                         rn = ru.value("username").toString();
@@ -658,6 +827,7 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         }
         m_dmChannels = list;
         emit dmChannelsChanged();
+        updateCurrentChannelIsDm();
         m_restOp = None;
         log("dms=%d", list.size());
         break;
@@ -668,6 +838,32 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
         setStatus("DM opened.");
         m_restOp = None;
         refreshDms();
+        break;
+    }
+    case DmCall: {
+        log("dm call started channel=%s", qPrintable(m_pendingVoiceChannel));
+        setStatus("Call connected.");
+        m_restOp = None;
+        break;
+    }
+    case FetchRegions: {
+        QVariantList list;
+        QJsonArray arr = doc.array();
+        for (const QJsonValue &v : arr) {
+            QJsonObject o = v.toObject();
+            QVariantMap m;
+            m["id"] = o.value("id").toString();
+            m["name"] = o.value("name").toString();
+            m["optimal"] = o.value("optimal").toBool();
+            m["deprecated"] = o.value("deprecated").toBool();
+            m["custom"] = o.value("custom").toBool();
+            m["vip"] = o.value("vip").toBool();
+            list.append(m);
+        }
+        m_regions = list;
+        emit regionsChanged();
+        log("voice regions=%d", list.size());
+        m_restOp = None;
         break;
     }
     case GuildMembers: {
@@ -703,6 +899,14 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     case SendFile: {
         log("file upload complete");
         setStatus("File uploaded.");
+        m_restOp = None;
+        break;
+    }
+    case ChannelPins: {
+        QJsonArray arr = doc.array();
+        normalizeMessages(arr);
+        m_pins = arr.toVariantList();
+        emit pinsChanged();
         m_restOp = None;
         break;
     }
@@ -758,6 +962,13 @@ void DiscordClient::addReaction(const QString &channelId, const QString &message
 }
 
 void DiscordClient::triggerTyping(const QString &channelId) {
+    if (channelId.isEmpty())
+        return;
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    qint64 last = m_lastTyping.value(channelId, 0);
+    if (now - last < 5000)
+        return;
+    m_lastTyping[channelId] = now;
     restPost(QString("/channels/%1/typing").arg(channelId), QJsonObject());
 }
 
@@ -793,6 +1004,8 @@ void DiscordClient::onDisconnected() {
     m_wantResume = m_resumable;
     setStatus("Disconnected");
     emit errorOccurred("WebSocket disconnected");
+    if (!m_fatalClose)
+        scheduleReconnect();
 }
 
 void DiscordClient::onReadyRead() {
@@ -816,6 +1029,7 @@ void DiscordClient::processHttp() {
     if (!status.contains("101")) {
         setStatus("WebSocket handshake failed");
         emit errorOccurred(QString("WS handshake failed: %1").arg(status));
+        m_sock.close();
         return;
     }
     m_inHttp = false;
@@ -872,7 +1086,27 @@ void DiscordClient::processFrames() {
 void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payload) {
     if (opcode == 0x8) {
         m_hbTimer.stop();
-        QCoreApplication::quit();
+        quint16 code = 0;
+        if (payload.size() >= 2)
+            code = (quint16)((quint8)payload[0] << 8 | (quint8)payload[1]);
+        static const quint16 fatal[] = { 4002, 4004, 4010, 4011, 4012, 4013, 4014 };
+        bool fatalClose = false;
+        for (quint16 c : fatal) {
+            if (c == code) {
+                fatalClose = true;
+                break;
+            }
+        }
+        if (fatalClose) {
+            m_fatalClose = true;
+            log("Fatal close code %u; not reconnecting", (unsigned)code);
+            setStatus("Session invalid");
+            emit errorOccurred(QString("WebSocket closed: %1").arg(code));
+            return;
+        }
+        log("Close code %u; resuming", (unsigned)code);
+        m_wantResume = m_resumable;
+        m_sock.close();
         return;
     }
     if (opcode == 0x9) { // ping
@@ -902,10 +1136,20 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         log("Hello; heartbeat %d ms", interval);
         m_hbTimer.start(interval);
         m_lastHeartbeat = QDateTime::currentMSecsSinceEpoch();
+        m_lastHeartbeatAck = QDateTime::currentMSecsSinceEpoch();
         return;
     }
-    if (op == 11)
+    if (op == 11) {
+        m_lastHeartbeatAck = QDateTime::currentMSecsSinceEpoch();
+        if (m_voiceLatencyStart > 0) {
+            int lat = (int)(m_lastHeartbeatAck - m_voiceLatencyStart);
+            if (lat != m_voiceLatency) {
+                m_voiceLatency = lat;
+                emit voiceLatencyChanged();
+            }
+        }
         return;
+    }
     if (op == 1) {
         sendOp(1, QJsonObject());
         return;
@@ -913,6 +1157,8 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
     if (op == 9) {
         setStatus("Invalid session");
         emit errorOccurred("Invalid session");
+        m_wantResume = false;
+        m_sock.close();
         return;
     }
     if (op == 7) {
@@ -928,10 +1174,12 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         m_sessionId = d.toObject().value("session_id").toString();
         m_resumable = !m_sessionId.isEmpty();
         m_wantResume = false;
+        m_reconnectAttempt = 0;
         log("READY; session=%s resumable=%d", qPrintable(m_sessionId), m_resumable ? 1 : 0);
         return;
     }
     if (t == "RESUMED") {
+        m_reconnectAttempt = 0;
         log("RESUMED");
         setStatus("Resumed.");
         return;
@@ -940,6 +1188,25 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         QJsonObject msg = d.toObject();
         QString cid = msg.value("channel_id").toString();
         log("MESSAGE_CREATE channel=%s", qPrintable(cid));
+        QJsonObject author = msg.value("author").toObject();
+        rememberUser(author);
+        const QJsonArray mentions = msg.value("mentions").toArray();
+        for (const QJsonValue &mv : mentions)
+            rememberUser(mv.toObject());
+        QString authorId = author.value("id").toString();
+        if (authorId != m_selfId) {
+            if (cid == m_currentChannelId) {
+                if (m_unread.remove(cid) > 0)
+                    emit unreadChanged();
+            } else if (!m_unread.contains(cid)) {
+                m_unread.insert(cid);
+                emit unreadChanged();
+            }
+            QString an = author.value("global_name").toString();
+            if (an.isEmpty())
+                an = author.value("username").toString();
+            emit messageReceived(an, msg.value("content").toString(), cid);
+        }
         if (cid == m_currentChannelId) {
             QJsonArray arr = m_messageCache.value(m_currentChannelId);
             arr.prepend(msg);
@@ -1168,6 +1435,308 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         }
         return;
     }
+    if (t == "CALL_CREATE") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        QJsonArray ringing = ev.value("ringing").toArray();
+        QStringList ringingUsers;
+        for (const QJsonValue &v : ringing)
+            ringingUsers << v.toString();
+        log("CALL_CREATE channel=%s ringing=%d", qPrintable(cid), ringingUsers.size());
+        m_pendingVoiceChannel = cid;
+        emit dmCallCreated(cid, ringingUsers);
+        return;
+    }
+    if (t == "CALL_UPDATE") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        log("CALL_UPDATE channel=%s", qPrintable(cid));
+        emit dmCallUpdated(cid);
+        return;
+    }
+    if (t == "CALL_DELETE") {
+        QJsonObject ev = d.toObject();
+        QString cid = ev.value("channel_id").toString();
+        log("CALL_DELETE channel=%s", qPrintable(cid));
+        emit dmCallDeleted(cid);
+        if (m_pendingVoiceChannel == cid)
+            m_pendingVoiceChannel.clear();
+        return;
+    }
+    if (t == "VOICE_STATE_UPDATE") {
+        applyVoiceState(d.toObject());
+        return;
+    }
+    if (t == "VOICE_SERVER_UPDATE") {
+        QJsonObject ev = d.toObject();
+        QString gid = ev.value("guild_id").toString();
+        QString endpoint = ev.value("endpoint").toString();
+        QString token = ev.value("token").toString();
+        log("VOICE_SERVER_UPDATE guild=%s endpoint=%s", qPrintable(gid), qPrintable(endpoint));
+        if (endpoint.isEmpty() || token.isEmpty()) {
+            emit voiceError(QStringLiteral("Voice server update incomplete"));
+            return;
+        }
+        QString serverId = gid.isEmpty() ? m_pendingVoiceChannel : gid;
+        if (serverId.isEmpty()) {
+            emit voiceError(QStringLiteral("Voice server update incomplete"));
+            return;
+        }
+        if (!gid.isEmpty() && !m_pendingVoiceGuild.isEmpty() && gid != m_pendingVoiceGuild) {
+            log("Ignoring stale voice server update for guild %s", qPrintable(gid));
+            return;
+        }
+        if (m_sessionId.isEmpty()) {
+            emit voiceError(QStringLiteral("Voice session not ready"));
+            return;
+        }
+        m_voice.setMicEnabled(!m_selfMute);
+        m_voice.connectVoice(endpoint, token, serverId, m_selfId, m_sessionId,
+                             m_pendingVoiceChannel);
+        return;
+    }
+}
+
+void DiscordClient::joinVoice(const QString &guildId, const QString &channelId) {
+    if (channelId.isEmpty()) {
+        leaveVoice();
+        return;
+    }
+    m_pendingVoiceGuild = guildId;
+    m_pendingVoiceChannel = channelId;
+    if (m_voiceChannelId != channelId || m_voiceGuildId != guildId) {
+        m_voiceChannelId = channelId;
+        m_voiceGuildId = guildId;
+        emit voiceChanged();
+    }
+    sendVoiceState();
+    setStatus(QStringLiteral("Joining voice..."));
+}
+
+void DiscordClient::leaveVoice() {
+    QJsonObject d;
+    if (!m_voiceGuildId.isEmpty())
+        d[QStringLiteral("guild_id")] = m_voiceGuildId;
+    d[QStringLiteral("channel_id")] = QJsonValue(QJsonValue::Null);
+    d[QStringLiteral("self_mute")] = m_selfMute;
+    d[QStringLiteral("self_deaf")] = m_selfDeaf;
+    sendOp(4, d);
+    m_voice.leave();
+    m_voiceChannelId.clear();
+    m_voiceGuildId.clear();
+    m_pendingVoiceGuild.clear();
+    m_pendingVoiceChannel.clear();
+    m_voiceParticipants.clear();
+    emit voiceParticipantsChanged();
+    emit voiceChanged();
+    setStatus(QStringLiteral("Left voice."));
+}
+
+void DiscordClient::fetchVoiceRegions() {
+    m_restOp = FetchRegions;
+    restGet("/voice/regions");
+}
+
+void DiscordClient::setVoiceRegion(const QString &regionId) {
+    if (m_currentChannelId.isEmpty())
+        return;
+    QJsonObject d;
+    d["rtc_region"] = regionId;
+    restPatch(QString("/channels/%1").arg(m_currentChannelId), d);
+}
+
+void DiscordClient::measureVoiceLatency() {
+    if (!m_voice.isConnected()) {
+        m_voiceLatency = -1;
+        emit voiceLatencyChanged();
+        return;
+    }
+    // Force a heartbeat now to measure round-trip
+    m_voiceLatencyStart = QDateTime::currentMSecsSinceEpoch();
+    sendOp(1, QJsonObject());
+    m_lastHeartbeat = m_voiceLatencyStart;
+}
+
+void DiscordClient::playSoundboardSound(const QString &soundId) {
+    if (!m_soundboardPlayer || soundId.isEmpty())
+        return;
+    m_soundboardPlayer->setSource(QUrl::fromLocalFile(soundId));
+    m_soundboardPlayer->play();
+}
+
+void DiscordClient::editVoiceMember(const QString &userId, bool mute, bool deaf,
+                                    const QString &channelId, const QString &nick) {
+    if (m_voiceGuildId.isEmpty() || userId.isEmpty())
+        return;
+    QJsonObject d;
+    if (mute) d["mute"] = true;
+    if (deaf) d["deaf"] = true;
+    if (channelId.isEmpty())
+        d["channel_id"] = QJsonValue::Null;
+    else
+        d["channel_id"] = channelId;
+    if (!nick.isEmpty())
+        d["nick"] = nick;
+    m_restOp = MemberEdit;
+    restPatch(QString("/guilds/%1/members/%2").arg(m_voiceGuildId, userId), d);
+}
+
+void DiscordClient::setSelfMute(bool mute) {
+    if (m_selfMute == mute)
+        return;
+    m_selfMute = mute;
+    emit selfMuteChanged();
+    m_voice.setMicEnabled(!mute);
+    playTone(400, 120);   // mute tone
+    if (inVoice())
+        sendVoiceState();
+}
+
+void DiscordClient::setSelfDeaf(bool deaf) {
+    if (m_selfDeaf == deaf)
+        return;
+    m_selfDeaf = deaf;
+    emit selfDeafChanged();
+    playTone(300, 150);   // deaf tone
+    if (inVoice())
+        sendVoiceState();
+}
+
+void DiscordClient::startDmCall(const QString &channelId)
+{
+    if (channelId.isEmpty())
+        return;
+    if (m_useBotPrefix) {
+        setStatus(QStringLiteral("Calls require a user token — log in with \"Use user token\" checked"));
+        return;
+    }
+    m_pendingVoiceGuild.clear();
+    m_pendingVoiceChannel = channelId;
+    m_voiceChannelId = channelId;
+    m_voiceGuildId.clear();
+    emit voiceChanged();
+    sendVoiceState();
+    m_restOp = DmCall;
+    restPost(QString("/channels/%1/call/ring").arg(channelId), QJsonObject());
+    setStatus(QStringLiteral("Call ringing..."));
+}
+
+void DiscordClient::stopDmRinging(const QString &channelId) {
+    if (channelId.isEmpty())
+        return;
+    m_restOp = DmCall;
+    restPost(QString("/channels/%1/call/stop-ringing").arg(channelId), QJsonObject());
+    setStatus(QStringLiteral("Stopped ringing."));
+}
+
+void DiscordClient::playTone(int frequencyHz, int durationMs)
+{
+    if (frequencyHz <= 0 || durationMs <= 0)
+        return;
+    const int sampleRate = 44100;
+    QAudioFormat format;
+    format.setSampleRate(sampleRate);
+    format.setChannelCount(1);
+    format.setSampleFormat(QAudioFormat::Int16);
+    int frames = sampleRate * durationMs / 1000;
+    QByteArray pcm;
+    pcm.resize(frames * 2);
+    short *samples = reinterpret_cast<short *>(pcm.data());
+    const double pi = 3.14159265358979323846;
+    double phase = 0.0;
+    double step = 2.0 * pi * frequencyHz / sampleRate;
+    const double volume = 0.12;
+    for (int i = 0; i < frames; ++i) {
+        samples[i] = static_cast<short>(volume * 32767.0 * qSin(phase));
+        phase += step;
+    }
+    QAudioSink *sink = new QAudioSink(format, this);
+    QBuffer *buf = new QBuffer(this);
+    buf->setData(pcm);
+    buf->open(QIODevice::ReadOnly);
+    QObject::connect(sink, &QAudioSink::stateChanged, this, [sink, buf](QtAudio::State state) {
+        if (state == QtAudio::IdleState || state == QtAudio::StoppedState) {
+            sink->stop();
+            sink->deleteLater();
+            buf->deleteLater();
+        }
+    });
+    sink->start(buf);
+}
+void DiscordClient::sendVoiceState()
+{
+    QString cid = m_pendingVoiceChannel.isEmpty() ? m_voiceChannelId : m_pendingVoiceChannel;
+    if (cid.isEmpty())
+        return;
+    QString gid = m_pendingVoiceGuild.isEmpty() ? m_voiceGuildId : m_pendingVoiceGuild;
+    QJsonObject d;
+    d[QStringLiteral("channel_id")] = cid;
+    d[QStringLiteral("self_mute")] = m_selfMute;
+    d[QStringLiteral("self_deaf")] = m_selfDeaf;
+    if (!gid.isEmpty())
+        d[QStringLiteral("guild_id")] = gid;
+    sendOp(4, d);
+}
+
+void DiscordClient::applyVoiceState(const QJsonObject &d) {
+    QString uid = d.value("user_id").toString();
+    QString cid = d.value("channel_id").toString();
+    QString gid = d.value("guild_id").toString();
+    if (uid.isEmpty())
+        return;
+
+    if (cid.isEmpty())
+        m_voiceStates.remove(uid);
+    else
+        m_voiceStates[uid] = voiceParticipantMap(d);
+
+    if (uid == m_selfId) {
+        if (cid.isEmpty()) {
+            if (!m_voiceChannelId.isEmpty()) {
+                m_voiceChannelId.clear();
+                m_voiceGuildId.clear();
+                m_pendingVoiceGuild.clear();
+                m_pendingVoiceChannel.clear();
+                m_voice.leave();
+                emit voiceChanged();
+            }
+        } else if (m_voiceChannelId != cid || m_voiceGuildId != gid) {
+            m_voiceChannelId = cid;
+            m_voiceGuildId = gid;
+            emit voiceChanged();
+        }
+        m_selfMute = d.value("self_mute").toBool();
+        m_selfDeaf = d.value("self_deaf").toBool();
+        emit selfMuteChanged();
+        emit selfDeafChanged();
+    }
+
+    int i = memberIndex(m_members, uid);
+    if (i >= 0) {
+        QVariantMap m = m_members[i].toMap();
+        if (cid.isEmpty())
+            m.remove("voice_channel");
+        else
+            m["voice_channel"] = cid;
+        m["voice_muted"] = d.value("mute").toBool() || d.value("self_mute").toBool();
+        m["voice_deaf"] = d.value("deaf").toBool() || d.value("self_deaf").toBool();
+        m_members[i] = m;
+        emit membersChanged();
+    } else {
+        emit membersChanged();
+    }
+    rebuildVoiceParticipants();
+}
+
+void DiscordClient::rebuildVoiceParticipants() {
+    QVariantList list;
+    for (auto it = m_voiceStates.constBegin(); it != m_voiceStates.constEnd(); ++it) {
+        if (!m_currentGuildId.isEmpty() && it.value().value("guildId").toString() != m_currentGuildId)
+            continue;
+        list.append(it.value());
+    }
+    m_voiceParticipants = list;
+    emit voiceParticipantsChanged();
 }
 
 void DiscordClient::onHeartbeat() {
@@ -1179,6 +1748,7 @@ void DiscordClient::onHeartbeat() {
         m_sock.close();
         return;
     }
+    m_voiceLatencyStart = now;
     sendOp(1, QJsonObject());
     m_lastHeartbeat = now;
     log("Heartbeat sent");
@@ -1260,6 +1830,24 @@ QString DiscordClient::markdownToHtml(const QString &text) const {
     s.replace("<", "&lt;");
     s.replace(">", "&gt;");
     s.replace("\"", "&quot;");
+
+    QRegularExpression re(QStringLiteral("&lt;@!?(\\d+)&gt;"));
+    QRegularExpressionMatchIterator it = re.globalMatch(s);
+    QString out;
+    int last = 0;
+    while (it.hasNext()) {
+        QRegularExpressionMatch m = it.next();
+        const QString id = m.captured(1);
+        const QString name = m_userNames.value(id);
+        out += s.mid(last, m.capturedStart() - last);
+        if (!name.isEmpty())
+            out += QStringLiteral("<span style=\"background-color:#3b3d44;border-radius:3px;padding:0 2px\">@") + name.toHtmlEscaped() + QStringLiteral("</span>");
+        else
+            out += m.captured();
+        last = m.capturedEnd();
+    }
+    out += s.mid(last);
+    s = out;
 
     s.replace(QRegularExpression("```([\\s\\S]*?)```"), "<pre>\\1</pre>");
     s.replace(QRegularExpression("`([^`]+)`"), "<code>\\1</code>");
