@@ -278,6 +278,7 @@ private:
     bool m_selfDeaf = true;
     void sendVoiceState();
     void applyVoiceState(const QJsonObject &d);
+    void storeVoiceState(const QJsonObject &d);
     void rebuildVoiceParticipants();
     void playTone(int frequencyHz, int durationMs);
 };

@@ -1435,6 +1435,29 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         }
         return;
     }
+    if (t == "GUILD_CREATE") {
+        QJsonObject ev = d.toObject();
+        QString gid = ev.value("id").toString();
+        const QJsonArray vs = ev.value("voice_states").toArray();
+        for (const QJsonValue &v : vs)
+            storeVoiceState(v.toObject());
+        rebuildVoiceParticipants();
+        log("GUILD_CREATE guild=%s voice_states=%d", qPrintable(gid), vs.size());
+        return;
+    }
+    if (t == "GUILD_DELETE") {
+        QJsonObject ev = d.toObject();
+        QString gid = ev.value("id").toString();
+        for (auto it = m_voiceStates.begin(); it != m_voiceStates.end();) {
+            if (it.value().value("guildId").toString() == gid)
+                it = m_voiceStates.erase(it);
+            else
+                ++it;
+        }
+        rebuildVoiceParticipants();
+        log("GUILD_DELETE guild=%s", qPrintable(gid));
+        return;
+    }
     if (t == "CALL_CREATE") {
         QJsonObject ev = d.toObject();
         QString cid = ev.value("channel_id").toString();
@@ -1678,19 +1701,38 @@ void DiscordClient::sendVoiceState()
     sendOp(4, d);
 }
 
-void DiscordClient::applyVoiceState(const QJsonObject &d) {
+void DiscordClient::storeVoiceState(const QJsonObject &d) {
     QString uid = d.value("user_id").toString();
     QString cid = d.value("channel_id").toString();
     QString gid = d.value("guild_id").toString();
     if (uid.isEmpty())
         return;
-
     if (cid.isEmpty())
         m_voiceStates.remove(uid);
     else
         m_voiceStates[uid] = voiceParticipantMap(d);
+    int i = memberIndex(m_members, uid);
+    if (i >= 0) {
+        QVariantMap m = m_members[i].toMap();
+        if (cid.isEmpty())
+            m.remove("voice_channel");
+        else
+            m["voice_channel"] = cid;
+        m["voice_muted"] = d.value("mute").toBool() || d.value("self_mute").toBool();
+        m["voice_deaf"] = d.value("deaf").toBool() || d.value("self_deaf").toBool();
+        m_members[i] = m;
+        emit membersChanged();
+    } else {
+        emit membersChanged();
+    }
+}
 
+void DiscordClient::applyVoiceState(const QJsonObject &d) {
+    QString uid = d.value("user_id").toString();
+    storeVoiceState(d);
     if (uid == m_selfId) {
+        QString cid = d.value("channel_id").toString();
+        QString gid = d.value("guild_id").toString();
         if (cid.isEmpty()) {
             if (!m_voiceChannelId.isEmpty()) {
                 m_voiceChannelId.clear();
@@ -1710,28 +1752,14 @@ void DiscordClient::applyVoiceState(const QJsonObject &d) {
         emit selfMuteChanged();
         emit selfDeafChanged();
     }
-
-    int i = memberIndex(m_members, uid);
-    if (i >= 0) {
-        QVariantMap m = m_members[i].toMap();
-        if (cid.isEmpty())
-            m.remove("voice_channel");
-        else
-            m["voice_channel"] = cid;
-        m["voice_muted"] = d.value("mute").toBool() || d.value("self_mute").toBool();
-        m["voice_deaf"] = d.value("deaf").toBool() || d.value("self_deaf").toBool();
-        m_members[i] = m;
-        emit membersChanged();
-    } else {
-        emit membersChanged();
-    }
     rebuildVoiceParticipants();
 }
 
 void DiscordClient::rebuildVoiceParticipants() {
     QVariantList list;
+    const QString guild = !m_voiceGuildId.isEmpty() ? m_voiceGuildId : m_currentGuildId;
     for (auto it = m_voiceStates.constBegin(); it != m_voiceStates.constEnd(); ++it) {
-        if (!m_currentGuildId.isEmpty() && it.value().value("guildId").toString() != m_currentGuildId)
+        if (!guild.isEmpty() && it.value().value("guildId").toString() != guild)
             continue;
         list.append(it.value());
     }
