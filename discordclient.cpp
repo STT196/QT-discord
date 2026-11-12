@@ -310,6 +310,7 @@ void DiscordClient::selectGuild(const QString &guildId) {
     }
     emit currentGuildIdChanged();
     emit currentChannelIdChanged();
+    updateCurrentChannelIsDm();
     m_messages.clear();
     emit messagesChanged();
     m_activeMessages.clear();
@@ -333,6 +334,7 @@ void DiscordClient::fetchChannelAt(int index) {
     m_textIndex = index;
     m_currentChannelId = m_textChannels[index];
     emit currentChannelIdChanged();
+    updateCurrentChannelIsDm();
     m_restOp = ChannelMessages;
     restGet(QString("/channels/%1/messages?limit=25").arg(m_currentChannelId));
 }
