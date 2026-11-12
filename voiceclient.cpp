@@ -124,7 +124,9 @@ void VoiceClient::connectVoice(const QString &endpoint, const QString &token,
     m_serverId = serverId;
     m_userId = userId;
     m_sessionId = sessionId;
-    m_channelId = channelId.isEmpty() ? serverId : channelId;
+    m_channelId = channelId;
+    if (m_channelId.isEmpty())
+        m_channelId = serverId;
 
     QString ep = endpoint.trimmed();
     if (ep.startsWith(QStringLiteral("wss://")))

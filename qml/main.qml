@@ -37,6 +37,7 @@ ApplicationWindow {
     property bool showPins: false
     property int voiceSeconds: 0
     property string voiceMenuUserId: ""
+    property string incomingCallId: ""
     MediaDevices { id: mediaDevices }
 
     readonly property var memberList: {
@@ -86,6 +87,12 @@ ApplicationWindow {
         for (var i = 0; i < client.guilds.length; ++i)
             if (client.guilds[i].id === client.voiceGuildId)
                 return client.guilds[i].name;
+        return "";
+    }
+    function dmChannelName(channelId) {
+        for (var i = 0; i < client.dmChannels.length; ++i)
+            if (client.dmChannels[i].id === channelId)
+                return client.dmChannels[i].name;
         return "";
     }
     function fmtElapsed(s) {
@@ -1876,6 +1883,14 @@ ApplicationWindow {
             if (!client.voiceConnected)
                 root.voiceSeconds = 0;
         }
+        function onDmCallCreated(channelId, ringingUsers) {
+            if (client.user && ringingUsers.indexOf(client.user.id) >= 0)
+                root.incomingCallId = channelId;
+        }
+        function onDmCallDeleted(channelId) {
+            if (root.incomingCallId === channelId)
+                root.incomingCallId = "";
+        }
     }
 
     Menu {
@@ -1910,6 +1925,60 @@ ApplicationWindow {
         MenuItem {
             text: "Copy User ID"
             onTriggered: client.copyToClipboard(voiceMenuUserId)
+        }
+    }
+
+    Rectangle {
+        id: incomingCallBanner
+        visible: root.incomingCallId.length > 0
+        anchors.top: parent.top
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.topMargin: 16
+        width: 340
+        height: 64
+        radius: 8
+        color: root.cUserPanel
+        border.color: root.cAccent
+        z: 1000
+        RowLayout {
+            anchors.fill: parent
+            anchors.margins: 10
+            spacing: 8
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                Text {
+                    text: "Incoming call"
+                    color: root.cMuted
+                    font.pixelSize: 11
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: root.dmChannelName(root.incomingCallId)
+                    color: root.cText
+                    font.pixelSize: 14
+                    font.bold: true
+                    elide: Text.ElideRight
+                }
+            }
+            Button {
+                text: "Accept"
+                implicitHeight: 28
+                onClicked: {
+                    var cid = root.incomingCallId;
+                    root.incomingCallId = "";
+                    client.joinVoice("", cid);
+                }
+            }
+            Button {
+                text: "Decline"
+                implicitHeight: 28
+                onClicked: {
+                    var cid = root.incomingCallId;
+                    root.incomingCallId = "";
+                    client.stopDmRinging(cid);
+                }
+            }
         }
     }
 }

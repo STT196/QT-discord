@@ -30,6 +30,7 @@ public:
 
     bool isConnected() const { return m_connected; }
     QString status() const { return m_status; }
+    void setStatus(const QString &s);
 
     static bool selfTest();
 
@@ -52,7 +53,6 @@ private slots:
     void onSslErrors(const QList<QSslError> &errors);
 
 private:
-    void setStatus(const QString &s);
     void fail(const QString &msg);
     void cleanup();
 

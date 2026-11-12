@@ -1465,12 +1465,16 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
     if (t == "CALL_CREATE") {
         QJsonObject ev = d.toObject();
         QString cid = ev.value("channel_id").toString();
-        QJsonArray ringing = ev.value("ringing").toArray();
-        QStringList ringingUsers;
-        for (const QJsonValue &v : ringing)
-            ringingUsers << v.toString();
+        QStringList ringingUsers = ev.value("ongoing_rings").toObject().keys();
         log("CALL_CREATE channel=%s ringing=%d", qPrintable(cid), ringingUsers.size());
-        m_pendingVoiceChannel = cid;
+        const QJsonArray states = ev.value("voice_states").toArray();
+        for (const QJsonValue &v : states)
+            storeVoiceState(v.toObject());
+        if (ringingUsers.contains(m_selfId)) {
+            m_pendingVoiceGuild.clear();
+            m_pendingVoiceChannel = cid;
+            playTone(880, 180);
+        }
         emit dmCallCreated(cid, ringingUsers);
         return;
     }
@@ -1488,6 +1492,12 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         emit dmCallDeleted(cid);
         if (m_pendingVoiceChannel == cid)
             m_pendingVoiceChannel.clear();
+        if (m_voiceChannelId == cid) {
+            m_voiceChannelId.clear();
+            m_voiceGuildId.clear();
+            m_voice.leave();
+            emit voiceChanged();
+        }
         return;
     }
     if (t == "VOICE_STATE_UPDATE") {
@@ -1517,9 +1527,14 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
             emit voiceError(QStringLiteral("Voice session not ready"));
             return;
         }
+
+        const QString voiceServerId = gid.isEmpty() ? m_pendingVoiceChannel : gid;
+        const QString voiceChannelId = m_pendingVoiceChannel.isEmpty() ? (gid.isEmpty() ? QString() : gid)
+                                                                      : m_pendingVoiceChannel;
+
         m_voice.setMicEnabled(!m_selfMute);
-        m_voice.connectVoice(endpoint, token, serverId, m_selfId, m_sessionId,
-                             m_pendingVoiceChannel);
+        m_voice.connectVoice(endpoint, token, voiceServerId, m_selfId, m_sessionId,
+                             voiceChannelId);
         return;
     }
 }
@@ -1639,18 +1654,31 @@ void DiscordClient::startDmCall(const QString &channelId)
     }
     m_pendingVoiceGuild.clear();
     m_pendingVoiceChannel = channelId;
-    m_voiceChannelId = channelId;
     m_voiceGuildId.clear();
+    m_voiceChannelId = channelId;
+    m_voice.setStatus(QStringLiteral("Call ringing..."));
     emit voiceChanged();
     sendVoiceState();
     m_restOp = DmCall;
     restPost(QString("/channels/%1/call/ring").arg(channelId), QJsonObject());
     setStatus(QStringLiteral("Call ringing..."));
+    playTone(660, 200);
+    QTimer::singleShot(350, this, [this, channelId]() {
+        if (m_pendingVoiceChannel == channelId && m_voiceChannelId == channelId)
+            playTone(880, 200);
+    });
 }
 
 void DiscordClient::stopDmRinging(const QString &channelId) {
     if (channelId.isEmpty())
         return;
+    m_pendingVoiceChannel.clear();
+    if (m_voiceChannelId == channelId) {
+        m_voiceChannelId.clear();
+        m_voiceGuildId.clear();
+        m_voice.leave();
+        emit voiceChanged();
+    }
     m_restOp = DmCall;
     restPost(QString("/channels/%1/call/stop-ringing").arg(channelId), QJsonObject());
     setStatus(QStringLiteral("Stopped ringing."));
