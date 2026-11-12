@@ -578,7 +578,7 @@ ApplicationWindow {
                                         Layout.preferredHeight: 28
                                         radius: 4
                                         color: root.cAccent
-                                        Text { anchors.centerIn: parent; text: "\uD83D\uDECD"; color: "#ffffff"; font.pixelSize: 14 }
+                                        Text { anchors.centerIn: parent; text: "\uD83D\uDCDE"; color: "#ffffff"; font.pixelSize: 14 }
                                     }
                                 }
                                 Rectangle {
@@ -806,7 +806,7 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             Text {
                                 Layout.fillWidth: true
-                                text: "Voice Connected"
+                                text: client.voiceGuildId.length > 0 ? "Voice Connected" : "Call"
                                 color: root.light ? "#248046" : "#23a55a"
                                 font.pixelSize: 12
                                 font.bold: true
@@ -1212,13 +1212,15 @@ ApplicationWindow {
                             Layout.preferredWidth: 28
                             Layout.preferredHeight: 28
                             radius: 4
+                            visible: client.currentChannelIsDm
                             color: root.cAccent
-                            Text { anchors.centerIn: parent; text: "\uD83D\uDECD"; color: "#ffffff"; font.pixelSize: 14 }
+                            Text { anchors.centerIn: parent; text: "\uD83D\uDCDE"; color: "#ffffff"; font.pixelSize: 14 }
                             MouseArea {
                                 anchors.fill: parent
                                 hoverEnabled: true
                                 onClicked: client.startDmCall(client.currentChannelId)
                             }
+                        }
                         }
                         Text { text: client.status; color: root.cMuted; font.pixelSize: 12; Layout.rightMargin: 16 }
                     }
