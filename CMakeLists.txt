@@ -45,6 +45,10 @@ add_custom_command(TARGET qdiscord POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             C:/Qt/6.12.0/mingw_64/plugins/multimedia $<TARGET_FILE_DIR:qdiscord>/multimedia
     COMMENT "Copying Qt multimedia plugins")
+add_custom_command(TARGET qdiscord POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            C:/Qt/6.12.0/mingw_64/plugins/imageformats $<TARGET_FILE_DIR:qdiscord>/imageformats
+    COMMENT "Copying Qt image format plugins")
 foreach(dll libssl-1_1-x64.dll libcrypto-1_1-x64.dll)
     add_custom_command(TARGET qdiscord POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
