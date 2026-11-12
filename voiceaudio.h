@@ -123,6 +123,7 @@ private:
             dave = 0, late = 0, plc = 0, played = 0;
     } m_stats;
     QElapsedTimer m_statClock;
+    QElapsedTimer m_tickGap;
 
     int m_daveVersion = 0;
     bool m_daveReady = false;

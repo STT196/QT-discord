@@ -6,6 +6,7 @@
 #include <QUrl>
 #include <QHostAddress>
 #include <QRandomGenerator>
+#include <QThread>
 
 #include <cstring>
 
@@ -59,8 +60,15 @@ static bool parseDiscoveryReply(const QByteArray &pkt, QString *ip, quint16 *por
 }
 
 VoiceClient::VoiceClient(QObject *parent) : QObject(parent) {
-    m_audio = new VoiceAudio(this);
+    // Media capture, playback, Opus and DAVE run on their own thread so GUI
+    // stalls (message list rebuilds, TLS handshakes) cannot starve the audio pump.
+    m_audio = new VoiceAudio;
     m_audio->loadLibraries();
+    m_audioThread = new QThread(this);
+    m_audioThread->setObjectName(QStringLiteral("voice-audio"));
+    m_audio->moveToThread(m_audioThread);
+    connect(m_audioThread, &QThread::finished, m_audio, &QObject::deleteLater);
+    m_audioThread->start();
     connect(m_audio, &VoiceAudio::daveKeyPackageReady, this,
             [this](const QByteArray &kp) {
                 QByteArray op(1, char(26));
@@ -90,6 +98,21 @@ VoiceClient::VoiceClient(QObject *parent) : QObject(parent) {
     connect(&m_connectTimer, &QTimer::timeout, this, &VoiceClient::onConnectTimeout);
     m_discoveryTimer.setSingleShot(true);
     m_connectTimer.setSingleShot(true);
+}
+
+VoiceClient::~VoiceClient() {
+    if (m_audioThread) {
+        m_audioThread->quit();
+        m_audioThread->wait();
+    }
+}
+
+void VoiceClient::postAudio(std::function<void(VoiceAudio *)> fn) {
+    VoiceAudio *audio = m_audio;
+    if (!audio)
+        return;
+    QMetaObject::invokeMethod(audio, [audio, fn = std::move(fn)] { fn(audio); },
+                              Qt::QueuedConnection);
 }
 
 void VoiceClient::connectVoice(const QString &endpoint, const QString &token,
@@ -148,8 +171,7 @@ void VoiceClient::leave() {
 
 void VoiceClient::setMicEnabled(bool enabled) {
     m_micWanted = enabled;
-    if (m_audio)
-        m_audio->setMicEnabled(enabled);
+    postAudio([enabled](VoiceAudio *a) { a->setMicEnabled(enabled); });
     if (m_connected)
         sendSpeaking(enabled);
 }
@@ -176,8 +198,7 @@ void VoiceClient::cleanup() {
     m_discoveryTimer.stop();
     m_connectTimer.stop();
     m_udp.close();
-    if (m_audio)
-        m_audio->stop();
+    postAudio([](VoiceAudio *a) { a->stop(); });
     if (m_sock.state() != QAbstractSocket::UnconnectedState)
         m_sock.close();
     m_buffer.clear();
@@ -367,7 +388,7 @@ void VoiceClient::onDiscoveryRead() {
             return;
         }
         if (m_audio)
-            m_audio->handleRtpPacket(pkt);
+            postAudio([pkt](VoiceAudio *a) { a->handleRtpPacket(pkt); });
     }
 }
 
@@ -541,11 +562,18 @@ void VoiceClient::handleMessage(const QByteArray &json) {
         qWarning("[voice] op4 session desc secret=%d mode=%s ssrc=%u",
                  m_secret.size(), qPrintable(mode), m_ssrc);
         if (m_audio) {
-            m_audio->configure(m_userId, m_channelId.toULongLong(), m_secret, m_ssrc, mode);
-            m_audio->start();
-            m_audio->setDaveProtocolVersion(
-                d.value(QStringLiteral("dave_protocol_version")).toInt());
-            m_audio->setMicEnabled(m_micWanted);
+            const QString uid = m_userId;
+            const quint64 ch = m_channelId.toULongLong();
+            const QByteArray secret = m_secret;
+            const quint32 ssrc = m_ssrc;
+            const int daveVersion = d.value(QStringLiteral("dave_protocol_version")).toInt();
+            const bool mic = m_micWanted;
+            postAudio([uid, ch, secret, ssrc, mode, daveVersion, mic](VoiceAudio *a) {
+                a->configure(uid, ch, secret, ssrc, mode);
+                a->start();
+                a->setDaveProtocolVersion(daveVersion);
+                a->setMicEnabled(mic);
+            });
         }
         sendSpeaking(m_micWanted);
         emit connectedChanged();
@@ -558,7 +586,7 @@ void VoiceClient::handleMessage(const QByteArray &json) {
             const QString uid = d.value(QStringLiteral("user_id")).toString();
             const quint32 ssrc = (quint32)d.value(QStringLiteral("ssrc")).toDouble();
             qWarning("[voice] op5 speaking user=%s ssrc=%u", qPrintable(uid), ssrc);
-            m_audio->setSpeakingUser(uid, ssrc);
+            postAudio([uid, ssrc](VoiceAudio *a) { a->setSpeakingUser(uid, ssrc); });
         }
         break;
     }
@@ -572,13 +600,18 @@ void VoiceClient::handleMessage(const QByteArray &json) {
         const QString id = d.value(QStringLiteral("user_id")).toString();
         m_clients.remove(id);
         if (m_audio)
-            m_audio->removeUser(id);
+            postAudio([id](VoiceAudio *a) { a->removeUser(id); });
         break;
     }
     case 21: {
         const int id = d.value(QStringLiteral("transition_id")).toInt();
         const int version = d.value(QStringLiteral("protocol_version")).toInt();
-        if (m_audio && m_audio->prepareDaveTransition(id, version)) {
+        bool ready = false;
+        if (m_audio)
+            QMetaObject::invokeMethod(m_audio, [this, id, version, &ready] {
+                ready = m_audio->prepareDaveTransition(id, version);
+            }, Qt::BlockingQueuedConnection);
+        if (ready) {
             QJsonObject r;
             r[QStringLiteral("transition_id")] = id;
             QJsonObject o;
@@ -589,13 +622,17 @@ void VoiceClient::handleMessage(const QByteArray &json) {
         break;
     }
     case 22:
-        if (m_audio)
-            m_audio->executeDaveTransition(d.value(QStringLiteral("transition_id")).toInt());
+        if (m_audio) {
+            const int id = d.value(QStringLiteral("transition_id")).toInt();
+            postAudio([id](VoiceAudio *a) { a->executeDaveTransition(id); });
+        }
         break;
     case 24:
-        if (m_audio)
-            m_audio->prepareDaveEpoch(d.value(QStringLiteral("epoch")).toInt(),
-                                      d.value(QStringLiteral("protocol_version")).toInt());
+        if (m_audio) {
+            const int epoch = d.value(QStringLiteral("epoch")).toInt();
+            const int version = d.value(QStringLiteral("protocol_version")).toInt();
+            postAudio([epoch, version](VoiceAudio *a) { a->prepareDaveEpoch(epoch, version); });
+        }
         break;
     default:
         break;
@@ -607,10 +644,14 @@ void VoiceClient::handleBinaryOp(int op, const QByteArray &payload) {
         return;
     switch (op) {
     case 25:
-        m_audio->setDaveExternalSender(payload);
+        postAudio([payload](VoiceAudio *a) { a->setDaveExternalSender(payload); });
         break;
     case 27: {
-        const QByteArray reply = m_audio->processDaveProposals(payload, m_clients.values());
+        QByteArray reply;
+        const QStringList clients = m_clients.values();
+        QMetaObject::invokeMethod(m_audio, [this, payload, clients, &reply] {
+            reply = m_audio->processDaveProposals(payload, clients);
+        }, Qt::BlockingQueuedConnection);
         if (!reply.isEmpty()) {
             QByteArray frame(1, char(28));
             sendWs(0x2, frame + reply);
@@ -619,7 +660,11 @@ void VoiceClient::handleBinaryOp(int op, const QByteArray &payload) {
     }
     case 29: {
         int id = 0;
-        if (m_audio->processDaveCommit(payload, &id) && id != 0) {
+        bool ok = false;
+        QMetaObject::invokeMethod(m_audio, [this, payload, &id, &ok] {
+            ok = m_audio->processDaveCommit(payload, &id);
+        }, Qt::BlockingQueuedConnection);
+        if (ok && id != 0) {
             QJsonObject d;
             d[QStringLiteral("transition_id")] = id;
             QJsonObject o;
@@ -631,7 +676,12 @@ void VoiceClient::handleBinaryOp(int op, const QByteArray &payload) {
     }
     case 30: {
         int id = 0;
-        if (m_audio->processDaveWelcome(payload, m_clients.values(), &id) && id != 0) {
+        bool ok = false;
+        const QStringList clients = m_clients.values();
+        QMetaObject::invokeMethod(m_audio, [this, payload, clients, &id, &ok] {
+            ok = m_audio->processDaveWelcome(payload, clients, &id);
+        }, Qt::BlockingQueuedConnection);
+        if (ok && id != 0) {
             QJsonObject d;
             d[QStringLiteral("transition_id")] = id;
             QJsonObject o;

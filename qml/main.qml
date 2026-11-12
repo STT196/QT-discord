@@ -159,7 +159,9 @@ ApplicationWindow {
     }
 
     function attachmentUrl(att) {
-        return att["proxy_url"] || att["url"] || "";
+        // Prefer the original CDN URL: media.discordapp.net transcodes to WebP,
+        // which this Qt build has no image plugin for ("Unsupported image format").
+        return att["url"] || att["proxy_url"] || "";
     }
 
     function fmtTime(ts) {

@@ -8,8 +8,10 @@
 #include <QElapsedTimer>
 #include <QSet>
 #include <QStringList>
+#include <functional>
 
 class VoiceAudio;
+class QThread;
 
 class VoiceClient : public QObject {
     Q_OBJECT
@@ -18,6 +20,7 @@ class VoiceClient : public QObject {
 
 public:
     explicit VoiceClient(QObject *parent = nullptr);
+    ~VoiceClient() override;
 
     void connectVoice(const QString &endpoint, const QString &token,
                       const QString &serverId, const QString &userId,
@@ -65,9 +68,13 @@ private:
     void startDiscovery();
     void sendSelectProtocol();
 
+    // Runs fn on the audio thread. Capture only values, never `this`.
+    void postAudio(std::function<void(VoiceAudio *)> fn);
+
     QSslSocket m_sock;
     QUdpSocket m_udp;
     VoiceAudio *m_audio = nullptr;
+    QThread *m_audioThread = nullptr;
     QTimer m_hbTimer;
     QElapsedTimer m_hbClock;
     QTimer m_discoveryTimer;

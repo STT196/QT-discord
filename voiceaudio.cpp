@@ -320,7 +320,8 @@ void VoiceAudio::ensureSink() {
     if (!dev.isFormatSupported(fmt))
         qWarning("[voice] 48k stereo output not reported as supported");
     m_sink = new QAudioSink(dev, fmt, this);
-    m_sink->setBufferSize(kFrameBytes * 8);
+    // Audio runs on the GUI thread, so leave room for UI/network stalls.
+    m_sink->setBufferSize(kFrameBytes * 16);
     m_sinkIo = m_sink->start();
     if (!m_sinkIo)
         qWarning("[voice] failed to start audio output");
@@ -343,7 +344,7 @@ void VoiceAudio::ensureSource() {
         return;
     }
     m_source = new QAudioSource(dev, fmt, this);
-    m_source->setBufferSize(kFrameBytes * 4);
+    m_source->setBufferSize(kFrameBytes * 12);
     m_sourceIo = m_source->start();
     if (!m_sourceIo) {
         qWarning("[voice] failed to start audio input");
@@ -623,6 +624,13 @@ void VoiceAudio::enqueueFrame(const QString &userId, quint16 rtpSeq, const QByte
 void VoiceAudio::onPlayTick() {
     if (!m_running || !m_sink || !m_sinkIo || !m_loaded)
         return;
+    if (m_tickGap.isValid()) {
+        const qint64 gap = m_tickGap.restart();
+        if (gap > 40)
+            qWarning("[voice] play tick late by %lld ms (audio thread starved)", (long long)gap);
+    } else {
+        m_tickGap.start();
+    }
     if (!m_statClock.isValid())
         m_statClock.start();
     if (m_statClock.elapsed() >= 1000) {
@@ -638,8 +646,8 @@ void VoiceAudio::onPlayTick() {
         const int free = m_sink->bytesFree();
         if (free < kFrameBytes)
             return;
-        if (m_sink->bufferSize() - free >= kFrameBytes * 3)
-            return;  // enough queued; stay ~60 ms ahead
+        if (m_sink->bufferSize() - free >= kFrameBytes * 6)
+            return;  // enough queued; stay ~120 ms ahead to absorb GUI stalls
 
         int acc[kFrameSamples * kChannels] = {0};
         bool any = false;
