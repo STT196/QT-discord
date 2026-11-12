@@ -1221,7 +1221,6 @@ ApplicationWindow {
                                 onClicked: client.startDmCall(client.currentChannelId)
                             }
                         }
-                        }
                         Text { text: client.status; color: root.cMuted; font.pixelSize: 12; Layout.rightMargin: 16 }
                     }
                 }
