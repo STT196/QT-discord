@@ -231,6 +231,13 @@ void VoiceAudio::start() {
         return;
     m_running = true;
     ensureSink();
+    if (!m_playTimer) {
+        m_playTimer = new QTimer(this);
+        m_playTimer->setTimerType(Qt::PreciseTimer);
+        m_playTimer->setInterval(5);
+        connect(m_playTimer, &QTimer::timeout, this, &VoiceAudio::onPlayTick);
+    }
+    m_playTimer->start();
     if (m_micWanted)
         ensureSource();
     qWarning("[voice] audio start loaded=%d running=%d sink=%d source=%d",
@@ -239,6 +246,10 @@ void VoiceAudio::start() {
 
 void VoiceAudio::stop() {
     m_running = false;
+    if (m_playTimer)
+        m_playTimer->stop();
+    m_jitter.clear();
+    m_unmapped.clear();
     if (m_sourceIo) {
         m_sourceIo = nullptr;
     }
@@ -309,7 +320,7 @@ void VoiceAudio::ensureSink() {
     if (!dev.isFormatSupported(fmt))
         qWarning("[voice] 48k stereo output not reported as supported");
     m_sink = new QAudioSink(dev, fmt, this);
-    m_sink->setBufferSize(kFrameBytes * 5);
+    m_sink->setBufferSize(kFrameBytes * 8);
     m_sinkIo = m_sink->start();
     if (!m_sinkIo)
         qWarning("[voice] failed to start audio output");
@@ -417,33 +428,52 @@ void VoiceAudio::handleRtpPacket(const QByteArray &packet) {
     if (!m_running || !m_loaded || packet.size() < 13)
         return;
     const quint8 *p = (const quint8 *)packet.constData();
-    if ((p[0] >> 6) != 2)
+    ++m_stats.rx;
+    if ((p[0] >> 6) != 2 || (p[1] & 0x7F) != kOpusPayloadType) {
+        ++m_stats.badHeader;
         return;
-    if ((p[1] & 0x7F) != kOpusPayloadType)
-        return;
+    }
 
     const quint32 ssrc = ((quint32)p[8] << 24) | ((quint32)p[9] << 16)
                          | ((quint32)p[10] << 8) | p[11];
-    if (ssrc == m_ssrc)
-        return;
-    const QString userId = m_ssrcUsers.value(ssrc);
-    if (userId.isEmpty() || userId == m_selfUserId) {
-        qWarning("[voice] rtp packet ssrc=%u no user mapping, dropping", ssrc);
+    if (ssrc == m_ssrc) {
+        ++m_stats.own;
         return;
     }
-    qWarning("[voice] rtp packet ssrc=%u user=%s", ssrc, qPrintable(userId));
+    const QString userId = m_ssrcUsers.value(ssrc);
+    if (userId == m_selfUserId && !userId.isEmpty()) {
+        ++m_stats.own;
+        return;
+    }
+    if (userId.isEmpty()) {
+        ++m_stats.unmapped;
+        if (!m_unmapped.contains(ssrc))
+            qWarning("[voice] audio from unmapped ssrc=%u (no op 5 yet)", ssrc);
+        // Audio can arrive before the Speaking (op 5) event maps the SSRC.
+        // Hold a short backlog and replay it once the user is known.
+        QList<QByteArray> &pending = m_unmapped[ssrc];
+        if (pending.size() < 25)
+            pending.append(packet);
+        return;
+    }
 
+    const quint16 rtpSeq = (quint16)((p[2] << 8) | p[3]);
     const int headerLen = headerLengthFor(packet);
     QByteArray opus = decryptTransport(packet, headerLen);
-    if (opus.isEmpty())
+    if (opus.isEmpty()) {
+        ++m_stats.transport;
         return;
-    if (opus == kSilence)
-        return;
-
-    opus = daveDecrypt(userId, opus);
-    if (opus.isEmpty())
-        return;
-    decodeAndPlay(userId, opus);
+    }
+    // Silence frames are not DAVE-encrypted. Keep them in the stream so the
+    // sequence stays contiguous and is not mistaken for packet loss.
+    if (opus != kSilence) {
+        opus = daveDecrypt(userId, opus);
+        if (opus.isEmpty()) {
+            ++m_stats.dave;  // decrypt failure: playout will conceal the gap
+            return;
+        }
+    }
+    enqueueFrame(userId, rtpSeq, opus);
 }
 
 QByteArray VoiceAudio::decryptTransport(const QByteArray &packet, int headerLength) {
@@ -555,33 +585,128 @@ QByteArray VoiceAudio::daveEncrypt(const QByteArray &opus) {
     return out;
 }
 
-void VoiceAudio::decodeAndPlay(const QString &userId, const QByteArray &opus) {
+void *VoiceAudio::decoderFor(const QString &userId) {
     void *dec = m_decoders.value(userId);
-    if (!dec) {
-        int err = 0;
-        dec = m_dlls->decoderCreate(kSampleRate, kChannels, &err);
-        if (!dec)
-            return;
+    if (dec)
+        return dec;
+    int err = 0;
+    dec = m_dlls->decoderCreate(kSampleRate, kChannels, &err);
+    if (dec)
         m_decoders.insert(userId, dec);
+    return dec;
+}
+
+void VoiceAudio::enqueueFrame(const QString &userId, quint16 rtpSeq, const QByteArray &opus) {
+    Jitter &j = m_jitter[userId];
+    qint64 ext;
+    if (!j.have) {
+        j.have = true;
+        ext = rtpSeq;
+        j.hi = ext;
+    } else {
+        ext = j.hi + (qint16)(rtpSeq - (quint16)j.hi);
+        if (ext > j.hi)
+            j.hi = ext;
     }
-    short pcm[5760 * kChannels];
-    const int samples = m_dlls->decode((OpusDecoder *)dec,
-                                      (const unsigned char *)opus.constData(),
-                                      opus.size(), pcm, 5760, 0);
-    if (samples <= 0)
-        return;
-    ensureSink();
-    if (!m_sinkIo) {
-        qWarning("[voice] decode ok (%d samples) but sink not ready", samples);
+    if (j.started && ext < j.next) {
+        ++m_stats.late;  // arrived too late to play
         return;
     }
-    qWarning("[voice] playing %d samples for user=%s", samples, qPrintable(userId));
-    m_sinkIo->write((const char *)pcm, samples * kChannels * 2);
+    j.q.insert(ext, opus);
+    while (j.q.size() > 15) {  // cap latency at ~300 ms
+        j.q.erase(j.q.begin());
+        if (j.started && !j.q.isEmpty())
+            j.next = j.q.firstKey();
+    }
+}
+
+void VoiceAudio::onPlayTick() {
+    if (!m_running || !m_sink || !m_sinkIo || !m_loaded)
+        return;
+    if (!m_statClock.isValid())
+        m_statClock.start();
+    if (m_statClock.elapsed() >= 1000) {
+        if (m_stats.rx)
+            qWarning("[voice] rx=%d played=%d plc=%d late=%d | drop: hdr=%d own=%d unmapped=%d transport=%d dave=%d",
+                     m_stats.rx, m_stats.played, m_stats.plc, m_stats.late,
+                     m_stats.badHeader, m_stats.own, m_stats.unmapped,
+                     m_stats.transport, m_stats.dave);
+        m_stats = Stats();
+        m_statClock.restart();
+    }
+    for (int round = 0; round < 4; ++round) {
+        const int free = m_sink->bytesFree();
+        if (free < kFrameBytes)
+            return;
+        if (m_sink->bufferSize() - free >= kFrameBytes * 3)
+            return;  // enough queued; stay ~60 ms ahead
+
+        int acc[kFrameSamples * kChannels] = {0};
+        bool any = false;
+        for (auto it = m_jitter.begin(); it != m_jitter.end(); ++it) {
+            Jitter &j = it.value();
+            if (!j.started) {
+                if (j.q.size() < 2)
+                    continue;  // prefill ~40 ms
+                j.started = true;
+                j.next = j.q.firstKey();
+                j.missed = 0;
+            }
+            void *dec = decoderFor(it.key());
+            if (!dec)
+                continue;
+            short pcm[kFrameSamples * kChannels];
+            int n = 0;
+            auto f = j.q.find(j.next);
+            if (f != j.q.end()) {
+                const QByteArray &opus = f.value();
+                n = m_dlls->decode((OpusDecoder *)dec,
+                                   (const unsigned char *)opus.constData(),
+                                   opus.size(), pcm, kFrameSamples, 0);
+                j.q.erase(f);
+                j.missed = 0;
+            } else if (!j.q.isEmpty()) {
+                if (j.q.firstKey() - j.next > 50) {
+                    j.next = j.q.firstKey();  // large jump: resync
+                    continue;
+                }
+                // Packet lost: conceal with Opus PLC and move on.
+                ++m_stats.plc;
+                n = m_dlls->decode((OpusDecoder *)dec, nullptr, 0, pcm, kFrameSamples, 0);
+            } else {
+                // Underrun: conceal briefly, then treat the stream as idle.
+                if (++j.missed > 3) {
+                    j.started = false;
+                    continue;
+                }
+                n = m_dlls->decode((OpusDecoder *)dec, nullptr, 0, pcm, kFrameSamples, 0);
+            }
+            ++j.next;
+            if (n <= 0)
+                continue;
+            if (n > kFrameSamples)
+                n = kFrameSamples;
+            for (int i = 0; i < n * kChannels; ++i)
+                acc[i] += pcm[i];
+            any = true;
+        }
+        if (!any)
+            return;
+        short out[kFrameSamples * kChannels];
+        for (int i = 0; i < kFrameSamples * kChannels; ++i)
+            out[i] = (short)qBound(-32768, acc[i], 32767);
+        m_sinkIo->write((const char *)out, kFrameBytes);
+        ++m_stats.played;
+    }
 }
 
 void VoiceAudio::setSpeakingUser(const QString &userId, quint32 ssrc) {
-    if (!userId.isEmpty() && ssrc)
-        m_ssrcUsers.insert(ssrc, userId);
+    if (userId.isEmpty() || !ssrc)
+        return;
+    m_ssrcUsers.insert(ssrc, userId);
+    const QList<QByteArray> backlog = m_unmapped.take(ssrc);
+    for (const QByteArray &pkt : backlog)
+        handleRtpPacket(pkt);
 }
 
 void VoiceAudio::removeUser(const QString &userId) {
@@ -591,6 +716,7 @@ void VoiceAudio::removeUser(const QString &userId) {
         else
             ++it;
     }
+    m_jitter.remove(userId);
     if (void *dec = m_decoders.take(userId)) {
         if (m_dlls && m_dlls->decoderDestroy)
             m_dlls->decoderDestroy((OpusDecoder *)dec);
@@ -644,6 +770,7 @@ void VoiceAudio::resetDaveKeys() {
 
 void VoiceAudio::resetDaveSession() {
     resetDaveKeys();
+    m_pendingExternalSender.clear();
     if (m_encryptor) {
         m_dlls->encryptorDestroy((DAVEEncryptorHandle)m_encryptor);
         m_encryptor = nullptr;
@@ -679,6 +806,12 @@ void VoiceAudio::setDaveProtocolVersion(int version) {
         m_dlls->encryptorSetPassthrough((DAVEEncryptorHandle)m_encryptor, true);
     }
     const QByteArray uid = m_selfUserId.toUtf8();
+    if (!m_pendingExternalSender.isEmpty()) {
+        m_dlls->sessionSetExternalSender((DAVESessionHandle)m_session,
+                                         (const uint8_t *)m_pendingExternalSender.constData(),
+                                         m_pendingExternalSender.size());
+        m_pendingExternalSender.clear();
+    }
     m_dlls->sessionInit((DAVESessionHandle)m_session, (uint16_t)version,
                         m_channelId, uid.constData());
     resetDaveKeys();
@@ -724,8 +857,12 @@ void VoiceAudio::executeDaveTransition(int transitionId) {
 }
 
 void VoiceAudio::setDaveExternalSender(const QByteArray &payload) {
-    if (!m_session || payload.isEmpty())
+    if (payload.isEmpty())
         return;
+    if (!m_session) {
+        m_pendingExternalSender = payload;
+        return;
+    }
     m_dlls->sessionSetExternalSender((DAVESessionHandle)m_session,
                                      (const uint8_t *)payload.constData(),
                                      payload.size());

@@ -366,7 +366,6 @@ void VoiceClient::onDiscoveryRead() {
             sendSelectProtocol();
             return;
         }
-        qWarning("[voice] udp datagram %d bytes (not discovery reply)", pkt.size());
         if (m_audio)
             m_audio->handleRtpPacket(pkt);
     }

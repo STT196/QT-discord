@@ -2,7 +2,10 @@
 
 #include <QByteArray>
 #include <QHash>
+#include <QElapsedTimer>
+#include <QMap>
 #include <QObject>
+#include <QTimer>
 #include <QStringList>
 
 class QAudioSink;
@@ -65,7 +68,9 @@ private:
     QByteArray decryptTransport(const QByteArray &packet, int headerLength);
     QByteArray daveDecrypt(const QString &userId, const QByteArray &opus);
     QByteArray daveEncrypt(const QByteArray &opus);
-    void decodeAndPlay(const QString &userId, const QByteArray &opus);
+    void *decoderFor(const QString &userId);
+    void enqueueFrame(const QString &userId, quint16 rtpSeq, const QByteArray &opus);
+    void onPlayTick();
     void sendOpus(const QByteArray &opus);
 
     Dlls *m_dlls = nullptr;
@@ -89,6 +94,7 @@ private:
     QByteArray m_micBuf;
 
     void *m_session = nullptr;
+    QByteArray m_pendingExternalSender;
     void *m_encryptor = nullptr;
     void *m_encoder = nullptr;
     void *m_selfRatchet = nullptr;
@@ -96,6 +102,27 @@ private:
     QHash<QString, void *> m_daveDecs;
     QHash<QString, void *> m_ratchets;
     QHash<quint32, QString> m_ssrcUsers;
+
+    // Receive-side jitter buffer: one queue per remote user, keyed by
+    // unwrapped RTP sequence number.
+    struct Jitter {
+        QMap<qint64, QByteArray> q;
+        qint64 next = 0;
+        qint64 hi = 0;
+        bool have = false;
+        bool started = false;
+        int missed = 0;
+    };
+    QHash<QString, Jitter> m_jitter;
+    QHash<quint32, QList<QByteArray>> m_unmapped;  // packets seen before op 5
+    QTimer *m_playTimer = nullptr;
+
+    // Per-second receive diagnostics.
+    struct Stats {
+        int rx = 0, badHeader = 0, own = 0, unmapped = 0, transport = 0,
+            dave = 0, late = 0, plc = 0, played = 0;
+    } m_stats;
+    QElapsedTimer m_statClock;
 
     int m_daveVersion = 0;
     bool m_daveReady = false;
