@@ -1824,6 +1824,15 @@ void DiscordClient::rebuildVoiceParticipants() {
     m_voiceParticipants = list;
     qWarning("[discord] voice participants: %d of %d states (guild=%s dmCall=%d)",
              list.size(), m_voiceStates.size(), qPrintable(guild), dmCall);
+    if (!m_voiceChannelId.isEmpty()) {
+        QStringList ids;
+        for (const QVariant &v : list) {
+            QVariantMap p = v.toMap();
+            if (p.value("channelId").toString() == m_voiceChannelId)
+                ids << p.value("userId").toString();
+        }
+        m_voice.setKnownUsers(ids);
+    }
     emit voiceParticipantsChanged();
 }
 

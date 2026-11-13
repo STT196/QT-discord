@@ -27,6 +27,9 @@ public:
                       const QString &sessionId, const QString &channelId);
     void leave();
     void setMicEnabled(bool enabled);
+    // Users currently in the voice channel. libdave rejects MLS commits and
+    // welcomes that mention users outside this set.
+    void setKnownUsers(const QStringList &users);
 
     bool isConnected() const { return m_connected; }
     QString status() const { return m_status; }

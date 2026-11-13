@@ -178,6 +178,20 @@ void VoiceClient::setMicEnabled(bool enabled) {
         sendSpeaking(enabled);
 }
 
+void VoiceClient::setKnownUsers(const QStringList &users) {
+    QSet<QString> next;
+    for (const QString &u : users) {
+        if (!u.isEmpty())
+            next.insert(u);
+    }
+    if (next.isEmpty())
+        return;
+    if (next == m_clients)
+        return;
+    m_clients = next;
+    qWarning("[voice] known users: %s", qPrintable(QStringList(m_clients.values()).join(',')));
+}
+
 void VoiceClient::setStatus(const QString &s) {
     if (s == m_status)
         return;
@@ -594,6 +608,7 @@ void VoiceClient::handleMessage(const QByteArray &json) {
         if (m_audio) {
             const QString uid = d.value(QStringLiteral("user_id")).toString();
             const quint32 ssrc = (quint32)d.value(QStringLiteral("ssrc")).toDouble();
+            m_clients.insert(uid);
             qWarning("[voice] op5 speaking user=%s ssrc=%u", qPrintable(uid), ssrc);
             postAudio([uid, ssrc](VoiceAudio *a) { a->setSpeakingUser(uid, ssrc); });
         }
@@ -662,6 +677,8 @@ void VoiceClient::handleBinaryOp(int op, const QByteArray &payload) {
         QMetaObject::invokeMethod(m_audio, [this, payload, clients, &reply] {
             reply = m_audio->processDaveProposals(payload, clients);
         }, Qt::BlockingQueuedConnection);
+        qWarning("[voice] op27 proposals=%d clients=%d reply=%d", payload.size(),
+                 clients.size(), reply.size());
         if (!reply.isEmpty()) {
             QByteArray frame(1, char(28));
             sendWs(0x2, frame + reply);

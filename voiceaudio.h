@@ -132,4 +132,5 @@ private:
     bool m_encryptorReady = false;
     bool m_decryptLogged = false;
     QHash<int, int> m_pending;
+    QHash<QString, qint64> m_retryAt;
 };

@@ -6,6 +6,7 @@
 #include <QAudioSource>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QDateTime>
 #include <QFileInfo>
 #include <QLibrary>
 #include <QMediaDevices>
@@ -527,6 +528,10 @@ QByteArray VoiceAudio::daveDecrypt(const QString &userId, const QByteArray &opus
     // A stale or missing key ratchet (decryptor created before the MLS group
     // existed, or before a transition) is the usual cause. Re-derive from the
     // current state and retry once; libdave ignores duplicate key domains.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_retryAt.value(userId, 0) + 500 > now)
+        return QByteArray();
+    m_retryAt.insert(userId, now);
     ensureDaveDecryptor(userId);
     return decryptDaveFrame(dec, opus);
 }
