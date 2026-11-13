@@ -201,6 +201,7 @@ private:
     QString m_currentGuildId;
     QString m_currentChannelId;
     RestOp m_restOp = None;
+    bool m_loadingMore = false;
     bool m_gatewayStarted = false;
     QNetworkAccessManager m_nam;
     QSslSocket m_sock;

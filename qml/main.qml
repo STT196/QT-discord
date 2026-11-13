@@ -1238,7 +1238,8 @@ ApplicationWindow {
                             return (m.content || "").toLowerCase().indexOf(root.msgSearch.toLowerCase()) !== -1;
                         })
                     spacing: 2
-                    onCountChanged: positionViewAtEnd()
+                    onCountChanged: if (atYEnd) positionViewAtEnd()
+                    onAtYBeginningChanged: if (atYBeginning) client.loadMoreMessages()
                     delegate: Rectangle {
                         width: messageView.width
                         height: msgLayout.implicitHeight + 12

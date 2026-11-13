@@ -185,11 +185,12 @@ void DiscordClient::setUseBotPrefix(bool useBot) { m_useBotPrefix = useBot; }
 void DiscordClient::setIntents(int intents) { m_intents = intents; }
 
 void DiscordClient::loadMoreMessages() {
-    if (m_currentChannelId.isEmpty())
+    if (m_currentChannelId.isEmpty() || m_loadingMore)
         return;
     auto it = m_messageCache.constFind(m_currentChannelId);
     if (it == m_messageCache.constEnd() || it.value().isEmpty())
         return;
+    m_loadingMore = true;
     QString before = it.value().last().toObject().value("id").toString();
     m_restOp = ChannelMessagesMore;
     restGet(QString("/channels/%1/messages?before=%2&limit=50").arg(m_currentChannelId, before));
@@ -336,7 +337,7 @@ void DiscordClient::fetchChannelAt(int index) {
     emit currentChannelIdChanged();
     updateCurrentChannelIsDm();
     m_restOp = ChannelMessages;
-    restGet(QString("/channels/%1/messages?limit=25").arg(m_currentChannelId));
+    restGet(QString("/channels/%1/messages?limit=50").arg(m_currentChannelId));
 }
 
 void DiscordClient::refreshMembers(const QString &guildId) {
@@ -487,7 +488,7 @@ void DiscordClient::selectChannel(const QString &channelId) {
     recomputeTyping();
     if (!m_messageCache.contains(channelId)) {
         m_restOp = ChannelMessages;
-        restGet(QString("/channels/%1/messages?limit=25").arg(channelId));
+        restGet(QString("/channels/%1/messages?limit=50").arg(channelId));
     } else {
         m_activeMessages = activeMessagesFrom(channelId);
         emit activeMessagesChanged();
@@ -594,6 +595,8 @@ void DiscordClient::onRestReply(QNetworkReply *reply) {
     const QByteArray data = reply->readAll();
     const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     const RestOp op = static_cast<RestOp>(reply->property("restOp").toInt());
+    if (op == ChannelMessagesMore)
+        m_loadingMore = false;
     const QString path = reply->property("restPath").toString();
     reply->deleteLater();
 
@@ -1205,7 +1208,8 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
     if (t == "MESSAGE_CREATE") {
         QJsonObject msg = d.toObject();
         QString cid = msg.value("channel_id").toString();
-        log("MESSAGE_CREATE channel=%s", qPrintable(cid));
+        log("MESSAGE_CREATE channel=%s current=%s matched=%d", qPrintable(cid),
+            qPrintable(m_currentChannelId), cid == m_currentChannelId ? 1 : 0);
         QJsonObject author = msg.value("author").toObject();
         rememberUser(author);
         const QJsonArray mentions = msg.value("mentions").toArray();
