@@ -1229,6 +1229,8 @@ ApplicationWindow {
                 // Messages
                 ListView {
                     id: messageView
+                    property bool followNewest: true
+                    property bool scrollToNewestOnModel: true
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
@@ -1238,7 +1240,13 @@ ApplicationWindow {
                             return (m.content || "").toLowerCase().indexOf(root.msgSearch.toLowerCase()) !== -1;
                         })
                     spacing: 2
-                    onCountChanged: if (atYEnd) positionViewAtEnd()
+                    onModelChanged: {
+                        var scroll = scrollToNewestOnModel || followNewest;
+                        scrollToNewestOnModel = false;
+                        if (scroll)
+                            Qt.callLater(positionViewAtEnd);
+                    }
+                    onMovementEnded: followNewest = atYEnd
                     onAtYBeginningChanged: if (atYBeginning) client.loadMoreMessages()
                     delegate: Rectangle {
                         width: messageView.width
@@ -1881,6 +1889,8 @@ ApplicationWindow {
             root.msgSearch = "";
             msgSearchInput.text = "";
             root.showPins = false;
+            messageView.followNewest = true;
+            messageView.scrollToNewestOnModel = true;
         }
         function onVoiceChanged() {
             if (!client.voiceConnected)
@@ -1985,5 +1995,4 @@ ApplicationWindow {
         }
     }
 }
-
 

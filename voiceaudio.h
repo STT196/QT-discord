@@ -114,8 +114,9 @@ private:
         qint64 hi = 0;
         bool have = false;
         bool started = false;
-        int missed = 0;
     };
+    enum class PlayoutAction { Wait, Decode, Conceal, Resync };
+    static PlayoutAction nextPlayoutAction(Jitter &j);
     QHash<QString, Jitter> m_jitter;
     QHash<quint32, QList<QByteArray>> m_unmapped;  // packets seen before op 5
     QTimer *m_playTimer = nullptr;
@@ -123,7 +124,7 @@ private:
     // Per-second receive diagnostics.
     struct Stats {
         int rx = 0, badHeader = 0, own = 0, unmapped = 0, transport = 0,
-            dave = 0, late = 0, plc = 0, played = 0;
+            dave = 0, late = 0, plc = 0, played = 0, shortWrite = 0;
     } m_stats;
     QElapsedTimer m_statClock;
     QElapsedTimer m_tickGap;

@@ -23,6 +23,7 @@ constexpr int kSampleRate = 48000;
 constexpr int kChannels = 2;
 constexpr int kFrameSamples = 960;
 constexpr int kFrameBytes = kFrameSamples * kChannels * 2;
+constexpr int kPrebufferFrames = 6;
 constexpr int kNonceSize = 24;
 constexpr int kTagSize = 16;
 constexpr int kOpusPayloadType = 120;
@@ -230,6 +231,9 @@ void VoiceAudio::start() {
     if (!m_loaded || m_running)
         return;
     m_running = true;
+    m_tickGap.invalidate();
+    m_statClock.invalidate();
+    m_stats = Stats();
     ensureSink();
     if (!m_playTimer) {
         m_playTimer = new QTimer(this);
@@ -246,6 +250,9 @@ void VoiceAudio::start() {
 
 void VoiceAudio::stop() {
     m_running = false;
+    m_tickGap.invalidate();
+    m_statClock.invalidate();
+    m_stats = Stats();
     if (m_playTimer)
         m_playTimer->stop();
     m_jitter.clear();
@@ -605,6 +612,24 @@ void VoiceAudio::enqueueFrame(const QString &userId, quint16 rtpSeq, const QByte
     }
 }
 
+VoiceAudio::PlayoutAction VoiceAudio::nextPlayoutAction(Jitter &j) {
+    if (!j.started) {
+        if (j.q.size() < kPrebufferFrames)
+            return PlayoutAction::Wait;
+        j.started = true;
+        j.next = j.q.firstKey();
+    }
+    if (j.q.contains(j.next))
+        return PlayoutAction::Decode;
+    if (j.q.isEmpty())
+        return PlayoutAction::Wait;
+    if (j.q.firstKey() - j.next > 50) {
+        j.next = j.q.firstKey();
+        return PlayoutAction::Resync;
+    }
+    return PlayoutAction::Conceal;
+}
+
 void VoiceAudio::onPlayTick() {
     if (!m_running || !m_sink || !m_sinkIo || !m_loaded)
         return;
@@ -619,10 +644,11 @@ void VoiceAudio::onPlayTick() {
         m_statClock.start();
     if (m_statClock.elapsed() >= 1000) {
         if (m_stats.rx)
-            qWarning("[voice] rx=%d played=%d plc=%d late=%d | drop: hdr=%d own=%d unmapped=%d transport=%d dave=%d",
-                     m_stats.rx, m_stats.played, m_stats.plc, m_stats.late,
-                     m_stats.badHeader, m_stats.own, m_stats.unmapped,
-                     m_stats.transport, m_stats.dave);
+            qWarning("[voice] rx=%d played=%d plc=%d late=%d short_write=%d | drop: hdr=%d own=%d unmapped=%d transport=%d dave=%d",
+                      m_stats.rx, m_stats.played, m_stats.plc, m_stats.late,
+                      m_stats.shortWrite,
+                      m_stats.badHeader, m_stats.own, m_stats.unmapped,
+                      m_stats.transport, m_stats.dave);
         m_stats = Stats();
         m_statClock.restart();
     }
@@ -637,40 +663,24 @@ void VoiceAudio::onPlayTick() {
         bool any = false;
         for (auto it = m_jitter.begin(); it != m_jitter.end(); ++it) {
             Jitter &j = it.value();
-            if (!j.started) {
-                if (j.q.size() < 2)
-                    continue;  // prefill ~40 ms
-                j.started = true;
-                j.next = j.q.firstKey();
-                j.missed = 0;
-            }
+            const PlayoutAction action = nextPlayoutAction(j);
+            if (action == PlayoutAction::Wait || action == PlayoutAction::Resync)
+                continue;
             void *dec = decoderFor(it.key());
             if (!dec)
                 continue;
             short pcm[kFrameSamples * kChannels];
             int n = 0;
-            auto f = j.q.find(j.next);
-            if (f != j.q.end()) {
+            if (action == PlayoutAction::Decode) {
+                auto f = j.q.find(j.next);
                 const QByteArray &opus = f.value();
                 n = m_dlls->decode((OpusDecoder *)dec,
                                    (const unsigned char *)opus.constData(),
                                    opus.size(), pcm, kFrameSamples, 0);
                 j.q.erase(f);
-                j.missed = 0;
-            } else if (!j.q.isEmpty()) {
-                if (j.q.firstKey() - j.next > 50) {
-                    j.next = j.q.firstKey();  // large jump: resync
-                    continue;
-                }
-                // Packet lost: conceal with Opus PLC and move on.
-                ++m_stats.plc;
-                n = m_dlls->decode((OpusDecoder *)dec, nullptr, 0, pcm, kFrameSamples, 0);
             } else {
-                // Underrun: conceal briefly, then treat the stream as idle.
-                if (++j.missed > 3) {
-                    j.started = false;
-                    continue;
-                }
+                // A newer packet proves this sequence was lost.
+                ++m_stats.plc;
                 n = m_dlls->decode((OpusDecoder *)dec, nullptr, 0, pcm, kFrameSamples, 0);
             }
             ++j.next;
@@ -682,12 +692,20 @@ void VoiceAudio::onPlayTick() {
                 acc[i] += pcm[i];
             any = true;
         }
-        if (!any)
+        if (!any) {
+            if (m_sink->bufferSize() - m_sink->bytesFree() < kFrameBytes) {
+                for (Jitter &j : m_jitter) {
+                    if (j.q.isEmpty())
+                        j.started = false;
+                }
+            }
             return;
+        }
         short out[kFrameSamples * kChannels];
         for (int i = 0; i < kFrameSamples * kChannels; ++i)
             out[i] = (short)qBound(-32768, acc[i], 32767);
-        m_sinkIo->write((const char *)out, kFrameBytes);
+        if (m_sinkIo->write((const char *)out, kFrameBytes) != kFrameBytes)
+            ++m_stats.shortWrite;
         ++m_stats.played;
     }
 }
@@ -1012,6 +1030,10 @@ bool VoiceAudio::loopbackTest() {
 
 bool VoiceAudio::selfTest() {
     bool ok = true;
+    auto fail = [&ok](const char *message) {
+        qWarning("[voice-selftest] %s", message);
+        ok = false;
+    };
     QByteArray plain(12, '\0');
     plain[0] = 0x80;
     if (headerLengthFor(plain) != 12) {
@@ -1027,5 +1049,27 @@ bool VoiceAudio::selfTest() {
         qWarning("[voice-selftest] silence frame mismatch");
         ok = false;
     }
+
+    Jitter j;
+    j.have = true;
+    j.q.insert(100, QByteArray("a"));
+    j.q.insert(101, QByteArray("b"));
+    if (nextPlayoutAction(j) != PlayoutAction::Wait || j.started || j.next != 0)
+        fail("started below prebuffer target");
+
+    j.q.clear();
+    for (qint64 seq = 100; seq < 106; ++seq)
+        j.q.insert(seq, QByteArray("x"));
+    if (nextPlayoutAction(j) != PlayoutAction::Decode || !j.started || j.next != 100)
+        fail("did not start at prebuffer target");
+
+    j.q.clear();
+    const qint64 before = j.next;
+    if (nextPlayoutAction(j) != PlayoutAction::Wait || j.next != before)
+        fail("empty queue advanced sequence");
+
+    j.q.insert(before + 1, QByteArray("future"));
+    if (nextPlayoutAction(j) != PlayoutAction::Conceal || j.next != before)
+        fail("proven gap did not request PLC");
     return ok;
 }
