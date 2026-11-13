@@ -25,7 +25,6 @@ constexpr int kFrameBytes = kFrameSamples * kChannels * 2;
 constexpr int kNonceSize = 24;
 constexpr int kTagSize = 16;
 constexpr int kOpusPayloadType = 120;
-constexpr int kFailureTolerance = 36;
 
 struct OpusDecoder;
 struct OpusEncoder;
@@ -74,6 +73,7 @@ struct VoiceAudio::Dlls {
     decltype(&daveSessionProcessCommit) sessionProcessCommit = nullptr;
     decltype(&daveSessionProcessWelcome) sessionProcessWelcome = nullptr;
     decltype(&daveSessionGetKeyRatchet) sessionGetKeyRatchet = nullptr;
+    decltype(&daveSessionGetLastEpochAuthenticator) sessionEpochAuth = nullptr;
     decltype(&daveKeyRatchetDestroy) keyRatchetDestroy = nullptr;
     decltype(&daveCommitResultIsFailed) commitIsFailed = nullptr;
     decltype(&daveCommitResultIsIgnored) commitIsIgnored = nullptr;
@@ -156,6 +156,7 @@ bool VoiceAudio::loadLibraries() {
     RESOLVE(d->sessionProcessCommit, "daveSessionProcessCommit");
     RESOLVE(d->sessionProcessWelcome, "daveSessionProcessWelcome");
     RESOLVE(d->sessionGetKeyRatchet, "daveSessionGetKeyRatchet");
+    RESOLVE(d->sessionEpochAuth, "daveSessionGetLastEpochAuthenticator");
     RESOLVE(d->keyRatchetDestroy, "daveKeyRatchetDestroy");
     RESOLVE(d->commitIsFailed, "daveCommitResultIsFailed");
     RESOLVE(d->commitIsIgnored, "daveCommitResultIsIgnored");
@@ -219,8 +220,6 @@ void VoiceAudio::configure(const QString &selfUserId, quint64 channelId,
     m_nonceCounter = 0;
     m_decryptLogged = false;
     m_pending.clear();
-    m_lastTransition = -1;
-    m_failures = 0;
     if (m_encryptor && ssrc)
         m_dlls->encryptorAssignSsrc((DAVEEncryptorHandle)m_encryptor, ssrc,
                                     DAVE_CODEC_OPUS);
@@ -275,7 +274,6 @@ void VoiceAudio::stop() {
             m_dlls->decoderDestroy((OpusDecoder *)dec);
     }
     m_decoders.clear();
-    resetDaveKeys();
     m_ssrcUsers.clear();
 }
 
@@ -516,31 +514,24 @@ QByteArray VoiceAudio::decryptTransport(const QByteArray &packet, int headerLeng
 }
 
 QByteArray VoiceAudio::daveDecrypt(const QString &userId, const QByteArray &opus) {
-    if (!m_daveReady || m_daveVersion == 0 || !m_session)
+    if (m_daveVersion == 0 || !m_session)
         return opus;
     void *dec = m_daveDecs.value(userId);
-    if (!dec) {
-        dec = m_dlls->decryptorCreate();
-        if (!dec)
-            return opus;
-        void *ratchet = m_ratchets.value(userId);
-        if (!ratchet) {
-            const QByteArray uid = userId.toUtf8();
-            ratchet = m_dlls->sessionGetKeyRatchet((DAVESessionHandle)m_session,
-                                                   uid.constData());
-            if (ratchet)
-                m_ratchets.insert(userId, ratchet);
-        }
-        if (ratchet) {
-            m_dlls->decryptorToRatchet((DAVEDecryptorHandle)dec,
-                                       (DAVEKeyRatchetHandle)ratchet);
-            m_dlls->decryptorToPassthrough((DAVEDecryptorHandle)dec, false);
-        } else {
-            m_dlls->decryptorToPassthrough((DAVEDecryptorHandle)dec, true);
-        }
-        m_daveDecs.insert(userId, dec);
-    }
+    if (!dec)
+        dec = ensureDaveDecryptor(userId);
+    if (!dec)
+        return opus;
+    QByteArray out = decryptDaveFrame(dec, opus);
+    if (!out.isEmpty())
+        return out;
+    // A stale or missing key ratchet (decryptor created before the MLS group
+    // existed, or before a transition) is the usual cause. Re-derive from the
+    // current state and retry once; libdave ignores duplicate key domains.
+    ensureDaveDecryptor(userId);
+    return decryptDaveFrame(dec, opus);
+}
 
+QByteArray VoiceAudio::decryptDaveFrame(void *dec, const QByteArray &opus) {
     size_t cap = m_dlls->decryptorMaxPlaintext((DAVEDecryptorHandle)dec,
                                               DAVE_MEDIA_TYPE_AUDIO, opus.size());
     if (cap < (size_t)opus.size() + 64)
@@ -551,26 +542,14 @@ QByteArray VoiceAudio::daveDecrypt(const QString &userId, const QByteArray &opus
         (DAVEDecryptorHandle)dec, DAVE_MEDIA_TYPE_AUDIO,
         (const uint8_t *)opus.constData(), opus.size(),
         (uint8_t *)out.data(), cap, &written);
-    if (rc != DAVE_DECRYPTOR_RESULT_CODE_SUCCESS) {
-        if (!m_pending.isEmpty())
-            return QByteArray();
-        ++m_failures;
-        if (m_failures > kFailureTolerance && m_lastTransition > 0) {
-            const int id = m_lastTransition;
-            m_failures = 0;
-            m_daveReady = false;
-            emit daveInvalidateTransition(id);
-            setDaveProtocolVersion(m_daveVersion);
-        }
+    if (rc != DAVE_DECRYPTOR_RESULT_CODE_SUCCESS)
         return QByteArray();
-    }
-    m_failures = 0;
     out.resize((int)written);
     return out;
 }
 
 QByteArray VoiceAudio::daveEncrypt(const QByteArray &opus) {
-    if (!m_daveReady || m_daveVersion == 0 || !m_encryptor)
+    if (!m_encryptorReady || m_daveVersion == 0 || !m_encryptor)
         return opus;
     const size_t cap = m_dlls->encryptorMaxCiphertext((DAVEEncryptorHandle)m_encryptor,
                                                      DAVE_MEDIA_TYPE_AUDIO, opus.size());
@@ -733,51 +712,86 @@ void VoiceAudio::removeUser(const QString &userId) {
         if (m_dlls && m_dlls->decryptorDestroy)
             m_dlls->decryptorDestroy((DAVEDecryptorHandle)dec);
     }
-    if (void *ratchet = m_ratchets.take(userId)) {
-        if (m_dlls && m_dlls->keyRatchetDestroy)
-            m_dlls->keyRatchetDestroy((DAVEKeyRatchetHandle)ratchet);
+}
+
+void *VoiceAudio::ensureDaveDecryptor(const QString &userId) {
+    if (!m_dlls || !m_session || userId.isEmpty() || userId == m_selfUserId)
+        return nullptr;
+    void *dec = m_daveDecs.value(userId);
+    const bool created = !dec;
+    if (!dec) {
+        dec = m_dlls->decryptorCreate();
+        if (!dec)
+            return nullptr;
+        m_daveDecs.insert(userId, dec);
+    }
+    const QByteArray uid = userId.toUtf8();
+    void *ratchet = m_dlls->sessionGetKeyRatchet((DAVESessionHandle)m_session,
+                                                 uid.constData());
+    if (!ratchet) {
+        if (created)
+            qWarning("[voice] dave decryptor for %s has no key ratchet yet",
+                     qPrintable(userId));
+        m_dlls->decryptorToPassthrough((DAVEDecryptorHandle)dec, true);
+        return dec;
+    }
+    // The C API copies the ratchet, so the handle can go away immediately. Old
+    // cryptor managers stay installed in the decryptor until they expire, which
+    // is what keeps frames from the previous epoch decryptable.
+    m_dlls->decryptorToRatchet((DAVEDecryptorHandle)dec,
+                               (DAVEKeyRatchetHandle)ratchet);
+    m_dlls->decryptorToPassthrough((DAVEDecryptorHandle)dec, false);
+    m_dlls->keyRatchetDestroy((DAVEKeyRatchetHandle)ratchet);
+    return dec;
+}
+
+void VoiceAudio::prepareDaveDecryptors(const QStringList &users) {
+    if (m_daveVersion == 0 || !m_session)
+        return;
+    for (const QString &u : users) {
+        if (!u.isEmpty() && u != m_selfUserId)
+            ensureDaveDecryptor(u);
     }
 }
 
-void VoiceAudio::resetDaveKeys() {
-    if (!m_dlls)
+void VoiceAudio::installDaveEncryptorRatchet() {
+    if (!m_dlls || !m_session || !m_encryptor || m_selfUserId.isEmpty())
         return;
-    for (void *dec : m_daveDecs) {
-        if (m_dlls && m_dlls->decryptorDestroy)
-            m_dlls->decryptorDestroy((DAVEDecryptorHandle)dec);
-    }
-    m_daveDecs.clear();
-    for (void *ratchet : m_ratchets) {
-        if (m_dlls && m_dlls->keyRatchetDestroy)
-            m_dlls->keyRatchetDestroy((DAVEKeyRatchetHandle)ratchet);
-    }
-    m_ratchets.clear();
-    if (m_selfRatchet) {
-        m_dlls->keyRatchetDestroy((DAVEKeyRatchetHandle)m_selfRatchet);
-        m_selfRatchet = nullptr;
-    }
-    m_daveReady = false;
-    if (!m_session || m_daveVersion == 0 || m_selfUserId.isEmpty())
-        return;
-
     const QByteArray uid = m_selfUserId.toUtf8();
     void *ratchet = m_dlls->sessionGetKeyRatchet((DAVESessionHandle)m_session,
                                                  uid.constData());
     if (!ratchet)
         return;
-    m_selfRatchet = ratchet;
-    if (m_encryptor) {
-        m_dlls->encryptorSetKeyRatchet((DAVEEncryptorHandle)m_encryptor,
-                                       (DAVEKeyRatchetHandle)ratchet);
-        m_dlls->encryptorSetPassthrough((DAVEEncryptorHandle)m_encryptor, false);
-    }
-    m_daveReady = true;
-    m_failures = 0;
-    qWarning("[voice] DAVE epoch active");
+    m_dlls->encryptorSetKeyRatchet((DAVEEncryptorHandle)m_encryptor,
+                                   (DAVEKeyRatchetHandle)ratchet);
+    m_dlls->encryptorSetPassthrough((DAVEEncryptorHandle)m_encryptor, false);
+    m_dlls->keyRatchetDestroy((DAVEKeyRatchetHandle)ratchet);
+    m_encryptorReady = true;
+    logDaveEpoch("execute");
+    qWarning("[voice] DAVE epoch active (encrypting)");
+}
+
+void VoiceAudio::logDaveEpoch(const char *where) {
+    if (!m_dlls || !m_session || !m_dlls->sessionEpochAuth)
+        return;
+    uint8_t *auth = nullptr;
+    size_t len = 0;
+    m_dlls->sessionEpochAuth((DAVESessionHandle)m_session, &auth, &len);
+    if (!auth)
+        return;
+    const QByteArray bytes((const char *)auth, (int)len);
+    m_dlls->freeBytes(auth);
+    qWarning("[voice] dave epoch %s auth=%s", where,
+             bytes.toHex().left(8).constData());
 }
 
 void VoiceAudio::resetDaveSession() {
-    resetDaveKeys();
+    m_encryptorReady = false;
+    for (void *dec : m_daveDecs) {
+        if (m_dlls && m_dlls->decryptorDestroy)
+            m_dlls->decryptorDestroy((DAVEDecryptorHandle)dec);
+    }
+    m_daveDecs.clear();
     m_pendingExternalSender.clear();
     if (m_encryptor) {
         m_dlls->encryptorDestroy((DAVEEncryptorHandle)m_encryptor);
@@ -822,7 +836,8 @@ void VoiceAudio::setDaveProtocolVersion(int version) {
     }
     m_dlls->sessionInit((DAVESessionHandle)m_session, (uint16_t)version,
                         m_channelId, uid.constData());
-    resetDaveKeys();
+    m_encryptorReady = false;
+    logDaveEpoch("init");
 
     size_t len = 0;
     uint8_t *kp = nullptr;
@@ -838,14 +853,22 @@ void VoiceAudio::prepareDaveEpoch(int epoch, int version) {
         setDaveProtocolVersion(version);
 }
 
-bool VoiceAudio::prepareDaveTransition(int transitionId, int version) {
-    m_pending.insert(transitionId, version);
+bool VoiceAudio::prepareDaveTransition(int transitionId, int version,
+                                       const QStringList &clients) {
+    prepareDaveDecryptors(clients);
+    logDaveEpoch("prepare");
+    if (version == 0) {
+        m_encryptorReady = false;
+        if (m_encryptor)
+            m_dlls->encryptorSetPassthrough((DAVEEncryptorHandle)m_encryptor, true);
+    }
     if (transitionId == 0) {
-        executeDaveTransition(0);
+        m_daveVersion = version;
+        if (version > 0)
+            installDaveEncryptorRatchet();
         return false;
     }
-    if (version == 0 && m_encryptor)
-        m_dlls->encryptorSetPassthrough((DAVEEncryptorHandle)m_encryptor, true);
+    m_pending.insert(transitionId, version);
     return true;
 }
 
@@ -853,15 +876,14 @@ void VoiceAudio::executeDaveTransition(int transitionId) {
     if (!m_pending.contains(transitionId))
         return;
     const int version = m_pending.take(transitionId);
-    m_lastTransition = transitionId;
+    m_daveVersion = version;
     if (version == 0) {
-        m_daveVersion = 0;
-        m_daveReady = false;
+        m_encryptorReady = false;
         if (m_encryptor)
             m_dlls->encryptorSetPassthrough((DAVEEncryptorHandle)m_encryptor, true);
-    } else {
-        m_daveVersion = version;
+        return;
     }
+    installDaveEncryptorRatchet();
 }
 
 void VoiceAudio::setDaveExternalSender(const QByteArray &payload) {
@@ -876,7 +898,8 @@ void VoiceAudio::setDaveExternalSender(const QByteArray &payload) {
                                      payload.size());
 }
 
-bool VoiceAudio::processDaveCommit(const QByteArray &payload, int *transitionId) {
+bool VoiceAudio::processDaveCommit(const QByteArray &payload,
+                                   const QStringList &clients, int *transitionId) {
     *transitionId = 0;
     if (payload.size() <= 2)
         return false;
@@ -898,9 +921,8 @@ bool VoiceAudio::processDaveCommit(const QByteArray &payload, int *transitionId)
         setDaveProtocolVersion(m_daveVersion);
         return false;
     }
-    resetDaveKeys();
-    if (!ignored && *transitionId != 0)
-        m_pending.insert(*transitionId, m_daveVersion);
+    if (!ignored)
+        prepareDaveTransition(*transitionId, m_daveVersion, clients);
     return true;
 }
 
@@ -929,9 +951,7 @@ bool VoiceAudio::processDaveWelcome(const QByteArray &payload,
         return false;
     }
     m_dlls->welcomeDestroy(result);
-    resetDaveKeys();
-    if (*transitionId != 0)
-        m_pending.insert(*transitionId, m_daveVersion);
+    prepareDaveTransition(*transitionId, m_daveVersion, clients);
     return true;
 }
 

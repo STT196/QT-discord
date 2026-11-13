@@ -35,9 +35,10 @@ public:
     // DAVE / MLS signalling. Payloads are the raw voice opcode payloads.
     void setDaveProtocolVersion(int version);
     void prepareDaveEpoch(int epoch, int version);
-    bool prepareDaveTransition(int transitionId, int version);
+    bool prepareDaveTransition(int transitionId, int version, const QStringList &clients);
     void executeDaveTransition(int transitionId);
-    bool processDaveCommit(const QByteArray &payload, int *transitionId);
+    bool processDaveCommit(const QByteArray &payload, const QStringList &clients,
+                           int *transitionId);
     bool processDaveWelcome(const QByteArray &payload, const QStringList &clients,
                             int *transitionId);
     void setDaveExternalSender(const QByteArray &payload);
@@ -63,9 +64,13 @@ private:
     void ensureSink();
     void ensureSource();
     void onMicRead();
-    void resetDaveKeys();
+    void *ensureDaveDecryptor(const QString &userId);
+    void prepareDaveDecryptors(const QStringList &users);
+    void installDaveEncryptorRatchet();
+    void logDaveEpoch(const char *where);
     void resetDaveSession();
     QByteArray decryptTransport(const QByteArray &packet, int headerLength);
+    QByteArray decryptDaveFrame(void *dec, const QByteArray &opus);
     QByteArray daveDecrypt(const QString &userId, const QByteArray &opus);
     QByteArray daveEncrypt(const QByteArray &opus);
     void *decoderFor(const QString &userId);
@@ -97,10 +102,8 @@ private:
     QByteArray m_pendingExternalSender;
     void *m_encryptor = nullptr;
     void *m_encoder = nullptr;
-    void *m_selfRatchet = nullptr;
     QHash<QString, void *> m_decoders;
     QHash<QString, void *> m_daveDecs;
-    QHash<QString, void *> m_ratchets;
     QHash<quint32, QString> m_ssrcUsers;
 
     // Receive-side jitter buffer: one queue per remote user, keyed by
@@ -126,9 +129,7 @@ private:
     QElapsedTimer m_tickGap;
 
     int m_daveVersion = 0;
-    bool m_daveReady = false;
+    bool m_encryptorReady = false;
     bool m_decryptLogged = false;
-    int m_lastTransition = -1;
-    int m_failures = 0;
     QHash<int, int> m_pending;
 };

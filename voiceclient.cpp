@@ -214,6 +214,8 @@ void VoiceClient::cleanup() {
     m_discoveryPort = 0;
     m_udpIp.clear();
     m_udpPort = 0;
+    m_publicIp.clear();
+    m_publicPort = 0;
     m_connected = false;
 }
 
@@ -327,8 +329,8 @@ void VoiceClient::sendSelectProtocol() {
         return;
     }
     QJsonObject data;
-    data[QStringLiteral("address")] = m_udpIp;
-    data[QStringLiteral("port")] = (int)m_udpPort;
+    data[QStringLiteral("address")] = m_publicIp;
+    data[QStringLiteral("port")] = (int)m_publicPort;
     data[QStringLiteral("mode")] = mode;
     QJsonObject d;
     d[QStringLiteral("protocol")] = QStringLiteral("udp");
@@ -382,8 +384,10 @@ void VoiceClient::onDiscoveryRead() {
         QString ip;
         quint16 port = 0;
         if (parseDiscoveryReply(pkt, &ip, &port)) {
-            m_udpIp = ip;
-            m_udpPort = port;
+            // The reply carries our own external address; it is only reported to
+            // the server in select_protocol, never used as the RTP destination.
+            m_publicIp = ip;
+            m_publicPort = port;
             m_discoveryTimer.stop();
             qWarning("[voice] discovery reply ip=%s port=%u", qPrintable(ip), port);
             sendSelectProtocol();
@@ -546,6 +550,9 @@ void VoiceClient::handleMessage(const QByteArray &json) {
             m_modes << v.toString();
         m_discoveryIp = d.value(QStringLiteral("ip")).toString();
         m_discoveryPort = (quint16)d.value(QStringLiteral("port")).toInt();
+        // op 2 carries the voice server's UDP endpoint: this is where RTP goes.
+        m_udpIp = m_discoveryIp;
+        m_udpPort = m_discoveryPort;
         qWarning("[voice] op2 ready ssrc=%u ip=%s port=%u modes=%d",
                  m_ssrc, qPrintable(m_discoveryIp), m_discoveryPort, m_modes.size());
         emit readyReceived((int)m_ssrc);
@@ -608,10 +615,11 @@ void VoiceClient::handleMessage(const QByteArray &json) {
     case 21: {
         const int id = d.value(QStringLiteral("transition_id")).toInt();
         const int version = d.value(QStringLiteral("protocol_version")).toInt();
+        const QStringList clients = m_clients.values();
         bool ready = false;
         if (m_audio)
-            QMetaObject::invokeMethod(m_audio, [this, id, version, &ready] {
-                ready = m_audio->prepareDaveTransition(id, version);
+            QMetaObject::invokeMethod(m_audio, [this, id, version, clients, &ready] {
+                ready = m_audio->prepareDaveTransition(id, version, clients);
             }, Qt::BlockingQueuedConnection);
         if (ready) {
             QJsonObject r;
@@ -663,8 +671,9 @@ void VoiceClient::handleBinaryOp(int op, const QByteArray &payload) {
     case 29: {
         int id = 0;
         bool ok = false;
-        QMetaObject::invokeMethod(m_audio, [this, payload, &id, &ok] {
-            ok = m_audio->processDaveCommit(payload, &id);
+        const QStringList clients = m_clients.values();
+        QMetaObject::invokeMethod(m_audio, [this, payload, clients, &id, &ok] {
+            ok = m_audio->processDaveCommit(payload, clients, &id);
         }, Qt::BlockingQueuedConnection);
         if (ok && id != 0) {
             QJsonObject d;

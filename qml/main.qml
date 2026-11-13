@@ -728,6 +728,7 @@ ApplicationWindow {
                                                     client.leaveVoice();
                                                 else
                                                     client.joinVoice(client.currentGuildId, modelData.id);
+                                                client.selectChannel(modelData.id);
                                             } else {
                                                 client.selectChannel(modelData.id);
                                             }

@@ -93,8 +93,8 @@ private:
     quint64 m_lastSeq = 0;
     quint32 m_ssrc = 0;
     QStringList m_modes;
-    QString m_discoveryIp, m_udpIp;
-    quint16 m_discoveryPort = 0, m_udpPort = 0;
+    QString m_discoveryIp, m_udpIp, m_publicIp;
+    quint16 m_discoveryPort = 0, m_udpPort = 0, m_publicPort = 0;
     QByteArray m_secret;
     QSet<QString> m_clients;
     bool m_micWanted = false;

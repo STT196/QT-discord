@@ -1173,11 +1173,27 @@ void DiscordClient::handleFrame(int opcode, bool /*fin*/, const QByteArray &payl
         return;
 
     if (t == "READY") {
-        m_sessionId = d.toObject().value("session_id").toString();
+        QJsonObject rd = d.toObject();
+        m_sessionId = rd.value("session_id").toString();
         m_resumable = !m_sessionId.isEmpty();
         m_wantResume = false;
         m_reconnectAttempt = 0;
-        log("READY; session=%s resumable=%d", qPrintable(m_sessionId), m_resumable ? 1 : 0);
+        // The initial payload carries the guild voice state snapshot; without it
+        // the participant list stays empty until someone moves channels.
+        int states = 0;
+        for (const QJsonValue &gv : rd.value("guilds").toArray()) {
+            QJsonObject g = gv.toObject();
+            const QString gid = g.value("id").toString();
+            for (const QJsonValue &vv : g.value("voice_states").toArray()) {
+                QJsonObject st = vv.toObject();
+                st[QStringLiteral("guild_id")] = gid;
+                storeVoiceState(st);
+                ++states;
+            }
+        }
+        rebuildVoiceParticipants();
+        log("READY; session=%s resumable=%d voice_states=%d",
+            qPrintable(m_sessionId), m_resumable ? 1 : 0, states);
         return;
     }
     if (t == "RESUMED") {
@@ -1763,6 +1779,9 @@ void DiscordClient::storeVoiceState(const QJsonObject &d) {
 
 void DiscordClient::applyVoiceState(const QJsonObject &d) {
     QString uid = d.value("user_id").toString();
+    qWarning("[discord] VOICE_STATE user=%s channel=%s guild=%s self=%d",
+             qPrintable(uid), qPrintable(d.value("channel_id").toString()),
+             qPrintable(d.value("guild_id").toString()), uid == m_selfId);
     storeVoiceState(d);
     if (uid == m_selfId) {
         QString cid = d.value("channel_id").toString();
@@ -1803,6 +1822,8 @@ void DiscordClient::rebuildVoiceParticipants() {
         list.append(it.value());
     }
     m_voiceParticipants = list;
+    qWarning("[discord] voice participants: %d of %d states (guild=%s dmCall=%d)",
+             list.size(), m_voiceStates.size(), qPrintable(guild), dmCall);
     emit voiceParticipantsChanged();
 }
 
